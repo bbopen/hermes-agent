@@ -12,12 +12,20 @@ from concurrent.futures import Future
 import json
 import os
 import tempfile
+import threading
 import urllib.error
 import urllib.request
 
 import pytest
 
 from plugins.platforms.a2a import protocol, runtime_policy, security, tools
+from plugins.platforms.a2a.control_plane import (
+    ContextAccessDenied,
+    PayloadConflict,
+    TaskAccessDenied,
+    TaskStore,
+    canonical_payload_sha256,
+)
 
 
 # --------------------------------------------------------------------------
@@ -239,6 +247,96 @@ class TestPersistence:
     def test_load_missing_is_empty(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         assert protocol.load_conversation("nope") == []
+
+
+class TestDurableControlPlane:
+    """Exercise the real SQLite state machine, not a mocked persistence shim."""
+
+    @staticmethod
+    def _claim(store, *, principal="peer-a", obo="brett", request="msg-1",
+               context="ctx-owned", payload=None):
+        return store.claim_request(
+            principal=principal,
+            on_behalf_of=obo,
+            capability="system.proof",
+            request_key=request,
+            payload_sha256=canonical_payload_sha256(payload or {"message": request}),
+            requested_context_id=context,
+            task_id=protocol.new_task_id(),
+            deadline_at=None,
+        )
+
+    def test_context_and_task_are_bound_to_principal_and_obo(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        store = TaskStore()
+        task, created = self._claim(store)
+        assert created is True
+        assert task["context_id"] == "ctx-owned"
+
+        with pytest.raises(ContextAccessDenied):
+            self._claim(store, principal="peer-b", request="msg-2")
+        with pytest.raises(ContextAccessDenied):
+            self._claim(store, obo="mallory", request="msg-3")
+        with pytest.raises(TaskAccessDenied):
+            store.get_task(task["task_id"], principal="peer-b", on_behalf_of="brett",
+                           capability="system.proof")
+        with pytest.raises(TaskAccessDenied):
+            store.get_task(task["task_id"], principal="peer-a", on_behalf_of="mallory",
+                           capability="system.proof")
+
+    def test_idempotency_conflict_and_exactly_once_terminal_event(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        store = TaskStore()
+        task, created = self._claim(store, payload={"message": "one"})
+        duplicate, duplicate_created = self._claim(store, payload={"message": "one"})
+        assert created is True
+        assert duplicate_created is False
+        assert duplicate["task_id"] == task["task_id"]
+
+        with pytest.raises(PayloadConflict):
+            self._claim(store, payload={"message": "changed"})
+
+        terminal, emitted = store.terminalize(task["task_id"], protocol.STATE_COMPLETED, "first")
+        suppressed, emitted_again = store.terminalize(task["task_id"], protocol.STATE_COMPLETED, "second")
+        assert emitted is True
+        assert emitted_again is False
+        assert terminal["result_text"] == suppressed["result_text"] == "first"
+        assert store.terminal_event_count(task["task_id"]) == 1
+
+    def test_concurrent_duplicate_claim_creates_one_task(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        store = TaskStore()
+        start = threading.Barrier(3)
+        results = []
+        errors = []
+
+        def claim():
+            try:
+                start.wait(timeout=2)
+                results.append(self._claim(store, request="concurrent-1", context="ctx-concurrent"))
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=claim), threading.Thread(target=claim)]
+        for thread in threads:
+            thread.start()
+        start.wait(timeout=2)
+        for thread in threads:
+            thread.join(timeout=5)
+        assert errors == []
+        assert len(results) == 2
+        assert sum(1 for _, created in results if created) == 1
+        assert len({task["task_id"] for task, _ in results}) == 1
+
+    def test_restart_reconciliation_never_replays_working_task(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        store = TaskStore()
+        task, _ = self._claim(store)
+        recovered = TaskStore().reconcile_after_restart()
+        assert [entry["task_id"] for entry in recovered] == [task["task_id"]]
+        restored = store.get_task(task["task_id"], enforce_capability=False)
+        assert restored["state"] == protocol.STATE_FAILED
+        assert "not resumed" in restored["result_text"]
 
 
 # --------------------------------------------------------------------------

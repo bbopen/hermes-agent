@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import hashlib
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -275,21 +276,31 @@ def audit(
     *,
     on_behalf_of: str = "",
     capability: str = "",
-) -> None:
+    request_id: str = "",
+    status: str = "",
+) -> bool:
     """Append an audit record. Best-effort — never raises into the caller."""
     try:
         rec = {
             "ts": time.time(),
             "direction": direction,  # "inbound" | "outbound"
             "peer": peer,
+            "principal": peer,
             "on_behalf_of": on_behalf_of,
             "capability": capability,
             "task_id": task_id,
-            "summary": (summary or "")[:500],
+            "request_id": request_id,
+            "status": status,
+            # Prompt and reply bodies are intentionally never audit records.
+            # A hash permits correlation without creating a second sensitive
+            # data store alongside the Hermes conversation state.
+            "body_sha256": hashlib.sha256((summary or "").encode("utf-8")).hexdigest(),
         }
         path = _audit_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        return True
     except Exception:
         logger.debug("A2A: audit write failed", exc_info=True)
+        return False

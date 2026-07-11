@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
 import time
 from concurrent.futures import Future
@@ -41,6 +42,16 @@ from gateway.config import Platform
 from gateway.session import build_session_key
 
 from . import protocol, security
+from .control_plane import (
+    ContextAccessDenied,
+    ControlPlaneError,
+    PayloadConflict,
+    TaskAccessDenied,
+    TaskStore,
+    TERMINAL_STATES,
+    canonical_payload_sha256,
+    task_to_wire,
+)
 from .runtime_policy import ActivePolicy, activate, deactivate
 
 logger = logging.getLogger(__name__)
@@ -51,6 +62,13 @@ _REPLY_TIMEOUT = 300  # seconds to wait for the agent to answer an inbound task
 
 class _AgentShuttingDown(RuntimeError):
     pass
+
+
+class _TaskInterrupted(RuntimeError):
+    pass
+
+
+_SAFE_EXTERNAL_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
 def _default_agent_name(extra: Optional[dict] = None) -> str:
@@ -82,9 +100,16 @@ class A2AAdapter(BasePlatformAdapter):
         self._server_thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
+        # Durable state is deliberately plugin-owned rather than part of the
+        # gateway session cache: task ownership and idempotency must survive a
+        # gateway restart without replaying a consequential request.
+        self._tasks = TaskStore()
+
         # Per-context reply futures: an inbound HTTP request blocks on its
         # future until adapter.send() resolves it with the agent's reply.
         self._pending_replies: Dict[str, Future] = {}
+        self._pending_tasks: Dict[str, str] = {}
+        self._active_tasks: Dict[str, str] = {}
         self._pending_lock = threading.Lock()
 
     @property
@@ -103,6 +128,26 @@ class A2AAdapter(BasePlatformAdapter):
             self._loop = asyncio.get_running_loop()
         except RuntimeError:
             self._loop = None
+
+        # Execution itself cannot be resumed safely after a process restart.
+        # Reconciliation therefore turns unfinished durable work into one
+        # visible terminal result rather than dispatching it again.
+        try:
+            recovered = self._tasks.reconcile_after_restart()
+            for task in recovered:
+                security.audit(
+                    "recovery", task["principal"], task["task_id"], "",
+                    on_behalf_of=task["on_behalf_of"], capability=task["capability"],
+                    request_id=task["request_key"], status=task["state"],
+                )
+        except Exception:
+            logger.error("A2A: durable task reconciliation failed", exc_info=True)
+            self._set_fatal_error(
+                "state_reconciliation_failed",
+                "A2A durable task state could not be reconciled safely.",
+                retryable=True,
+            )
+            return False
 
         adapter = self
 
@@ -154,12 +199,56 @@ class A2AAdapter(BasePlatformAdapter):
                     if denial:
                         self._json(403, protocol.jsonrpc_error(req_id, -32003, denial))
                         return
-                    # We answer message/stream as a single (non-streamed) result.
-                    result = adapter._handle_inbound_task(params, policy)
+                    try:
+                        # We answer message/stream as a single (non-streamed) result.
+                        result = adapter._handle_inbound_task(params, policy, req_id)
+                    except PayloadConflict:
+                        self._json(409, protocol.jsonrpc_error(
+                            req_id, -32009, "request identity conflicts with an existing payload",
+                        ))
+                        return
+                    except ContextAccessDenied:
+                        self._json(403, protocol.jsonrpc_error(
+                            req_id, -32003, "context is not authorized for this delegation",
+                        ))
+                        return
+                    except ValueError as e:
+                        self._json(400, protocol.jsonrpc_error(req_id, -32602, str(e)))
+                        return
+                    except ControlPlaneError:
+                        logger.warning("A2A: rejected invalid durable task state", exc_info=True)
+                        self._json(409, protocol.jsonrpc_error(
+                            req_id, -32010, "durable task state is unavailable",
+                        ))
+                        return
                     self._json(200, protocol.jsonrpc_result(req_id, result))
                     return
                 if method == "tasks/get":
-                    self._json(200, protocol.jsonrpc_result(req_id, {"error": "task store not retained"}))
+                    policy, denial = adapter._request_policy(params, identity)
+                    if denial:
+                        self._json(403, protocol.jsonrpc_error(req_id, -32003, denial))
+                        return
+                    task_id = str(params.get("taskId") or params.get("id") or "").strip()
+                    if not _SAFE_EXTERNAL_ID.fullmatch(task_id):
+                        self._json(400, protocol.jsonrpc_error(req_id, -32602, "valid task id is required"))
+                        return
+                    try:
+                        task = adapter._tasks.get_task(
+                            task_id,
+                            principal=policy.principal,
+                            on_behalf_of=policy.on_behalf_of,
+                            capability=policy.capability,
+                            enforce_capability=not identity.legacy,
+                        )
+                    except TaskAccessDenied:
+                        self._json(403, protocol.jsonrpc_error(
+                            req_id, -32003, "task is not authorized for this delegation",
+                        ))
+                        return
+                    if task is None:
+                        self._json(404, protocol.jsonrpc_error(req_id, -32004, "task not found"))
+                        return
+                    self._json(200, protocol.jsonrpc_result(req_id, task_to_wire(task)))
                     return
                 self._json(200, protocol.jsonrpc_error(req_id, -32601, f"method not found: {method}"))
 
@@ -200,6 +289,8 @@ class A2AAdapter(BasePlatformAdapter):
                 if not fut.done():
                     fut.set_exception(_AgentShuttingDown("agent shutting down"))
             self._pending_replies.clear()
+            self._pending_tasks.clear()
+            self._active_tasks.clear()
 
     # ── Agent Card ────────────────────────────────────────────────────────
 
@@ -230,9 +321,16 @@ class A2AAdapter(BasePlatformAdapter):
 
     def _request_policy(self, params: dict, identity: security.PeerIdentity):
         message = params.get("message", {}) or {}
+        if message and not isinstance(message, dict):
+            return None, "message must be an object"
         metadata = message.get("metadata") or params.get("metadata") or {}
         if not isinstance(metadata, dict):
-            metadata = {}
+            return None, "metadata must be an object"
+        if not identity.legacy and (
+            not isinstance(metadata.get("on_behalf_of"), str)
+            or not isinstance(metadata.get("capability"), str)
+        ):
+            return None, "on_behalf_of and capability must be strings"
         on_behalf_of = str(metadata.get("on_behalf_of") or "").strip()
         capability = str(metadata.get("capability") or "").strip()
         denial = security.authorize_claims(identity, on_behalf_of, capability)
@@ -269,19 +367,119 @@ class A2AAdapter(BasePlatformAdapter):
             tool_rules=tool_rules,
         ), None
 
-    def _handle_inbound_task(self, params: dict, policy: ActivePolicy) -> dict:
+    @staticmethod
+    def _request_key(params: dict, req_id: Any) -> str:
+        message = params.get("message") or {}
+        if not isinstance(message, dict):
+            return ""
+        value = (
+            message.get("messageId")
+            or params.get("idempotencyKey")
+            or req_id
+        )
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            value = str(value)
+        if not isinstance(value, str):
+            return ""
+        value = value.strip()
+        return value if _SAFE_EXTERNAL_ID.fullmatch(value) else ""
+
+    @staticmethod
+    def _context_id(params: dict) -> str:
+        message = params.get("message") or {}
+        if not isinstance(message, dict):
+            raise ValueError("message must be an object")
+        value = message.get("contextId") or params.get("contextId") or ""
+        if value and (not isinstance(value, str) or not _SAFE_EXTERNAL_ID.fullmatch(value)):
+            raise ValueError("contextId must contain only letters, digits, '_' or '-'")
+        return str(value or "")
+
+    def _finish_task(
+        self,
+        task_id: str,
+        state: str,
+        result: str,
+        *,
+        policy: ActivePolicy,
+        request_id: str,
+    ) -> dict:
+        stored, emitted = self._tasks.terminalize(task_id, state, security.redact_outbound(result or ""))
+        if emitted:
+            security.audit(
+                "terminal", policy.principal, task_id, "",
+                on_behalf_of=policy.on_behalf_of,
+                capability=policy.capability,
+                request_id=request_id,
+                status=stored["state"],
+            )
+        return stored
+
+    def _wait_for_task(self, task_id: str, timeout: float) -> dict:
+        """Wait for the one creator, including a restart-safe poll fallback."""
+        until = time.monotonic() + max(0.0, timeout)
+        while True:
+            task = self._tasks.get_task(task_id, enforce_capability=False)
+            if task is None:
+                raise ControlPlaneError("durable task state disappeared")
+            if task["state"] in TERMINAL_STATES:
+                return task
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                return task
+            with self._pending_lock:
+                fut = self._pending_replies.get(task["context_id"])
+            if fut is not None:
+                try:
+                    fut.result(timeout=min(remaining, 0.1))
+                except Exception:
+                    pass
+            else:
+                time.sleep(min(remaining, 0.05))
+
+    def _handle_inbound_task(self, params: dict, policy: ActivePolicy, req_id: Any) -> dict:
         """Route an inbound A2A task into the live session and wait for reply.
 
         Runs on an HTTP worker thread. It marshals a MessageEvent onto the
         gateway loop and blocks (on a Future) until adapter.send() fulfils it.
         """
+        message = params.get("message") or {}
+        if not isinstance(message, dict):
+            raise ValueError("message must be an object")
+        request_id = self._request_key(params, req_id)
+        if not request_id:
+            # A fallback generated id would make retries look like unrelated
+            # tasks.  Consequential task delivery needs an explicit stable id.
+            raise ValueError("messageId or idempotencyKey is required")
+        requested_context_id = self._context_id(params)
         text = protocol.extract_text(params)
         peer = policy.principal
-        context_id = (params.get("message", {}) or {}).get("contextId") or protocol.new_context_id()
         task_id = protocol.new_task_id()
+        payload = {
+            "method": "message/send",
+            "message": message,
+            "metadata": params.get("metadata") or {},
+        }
+        task, created = self._tasks.claim_request(
+            principal=policy.principal,
+            on_behalf_of=policy.on_behalf_of,
+            capability=policy.capability,
+            request_key=request_id,
+            payload_sha256=canonical_payload_sha256(payload),
+            requested_context_id=requested_context_id,
+            task_id=task_id,
+            deadline_at=None,
+        )
+        if not created:
+            return task_to_wire(self._wait_for_task(task["task_id"], self.reply_timeout))
+
+        task_id = task["task_id"]
+        context_id = task["context_id"]
 
         if not text:
-            return protocol.build_task(task_id, context_id, protocol.STATE_FAILED, "Empty task — nothing to do.")
+            return task_to_wire(self._finish_task(
+                task_id, protocol.STATE_FAILED, "Empty task — nothing to do.",
+                policy=policy, request_id=request_id,
+            ))
 
         framed = security.wrap_inbound(
             peer,
@@ -290,27 +488,31 @@ class A2AAdapter(BasePlatformAdapter):
             capability=policy.capability,
         )
         security.audit(
-            "inbound", peer, task_id, text,
+            "inbound", peer, task_id, "",
             on_behalf_of=policy.on_behalf_of,
             capability=policy.capability,
+            request_id=request_id,
+            status=protocol.STATE_WORKING,
         )
         protocol.persist_message(context_id, "user", text, task_id)
 
         if self._loop is None or self._message_handler is None:
-            return protocol.build_task(
-                task_id, context_id, protocol.STATE_FAILED,
-                "Agent gateway not ready to accept A2A tasks.",
-            )
+            return task_to_wire(self._finish_task(
+                task_id, protocol.STATE_FAILED, "Agent gateway not ready to accept A2A tasks.",
+                policy=policy, request_id=request_id,
+            ))
 
         if not activate(context_id, policy):
-            return protocol.build_task(
-                task_id, context_id, protocol.STATE_FAILED,
-                "Another task is already active for this context.",
-            )
+            return task_to_wire(self._finish_task(
+                task_id, protocol.STATE_FAILED, "Another task is already active for this context.",
+                policy=policy, request_id=request_id,
+            ))
 
         fut: Future = Future()
         with self._pending_lock:
             self._pending_replies[context_id] = fut
+            self._pending_tasks[context_id] = task_id
+            self._active_tasks[task_id] = context_id
 
         event = MessageEvent(
             text=framed,
@@ -335,18 +537,26 @@ class A2AAdapter(BasePlatformAdapter):
         except Exception as e:
             with self._pending_lock:
                 self._pending_replies.pop(context_id, None)
+                self._pending_tasks.pop(context_id, None)
+                self._active_tasks.pop(task_id, None)
             deactivate(context_id)
-            return protocol.build_task(task_id, context_id, protocol.STATE_FAILED, f"Dispatch failed: {e}")
+            return task_to_wire(self._finish_task(
+                task_id, protocol.STATE_FAILED, f"Dispatch failed: {e}",
+                policy=policy, request_id=request_id,
+            ))
 
         try:
-            reply = fut.result(timeout=self.reply_timeout)
-            state = protocol.STATE_COMPLETED
+            fut.result(timeout=self.reply_timeout)
         except _AgentShuttingDown:
-            reply = "[agent shutting down]"
-            state = protocol.STATE_FAILED
+            self._finish_task(
+                task_id, protocol.STATE_FAILED, "[agent shutting down]",
+                policy=policy, request_id=request_id,
+            )
         except Exception:
-            reply = "[agent did not reply in time]"
-            state = protocol.STATE_FAILED
+            self._finish_task(
+                task_id, protocol.STATE_FAILED, "[agent did not reply in time]",
+                policy=policy, request_id=request_id,
+            )
             # A timeout is an execution boundary, not only an HTTP waiting
             # boundary. Cancel the gateway session so the model cannot keep
             # running tools after the caller has given up and the capability
@@ -373,17 +583,18 @@ class A2AAdapter(BasePlatformAdapter):
                 )
         finally:
             with self._pending_lock:
-                self._pending_replies.pop(context_id, None)
+                if self._pending_replies.get(context_id) is fut:
+                    self._pending_replies.pop(context_id, None)
+                    self._pending_tasks.pop(context_id, None)
+                self._active_tasks.pop(task_id, None)
             deactivate(context_id)
 
-        reply = security.redact_outbound(reply or "")
+        final_task = self._tasks.get_task(task_id, enforce_capability=False)
+        if final_task is None:
+            raise ControlPlaneError("durable task state disappeared")
+        reply = str(final_task.get("result_text") or "")
         protocol.persist_message(context_id, "agent", reply, task_id)
-        security.audit(
-            "outbound", peer, task_id, reply,
-            on_behalf_of=policy.on_behalf_of,
-            capability=policy.capability,
-        )
-        return protocol.build_task(task_id, context_id, state, reply)
+        return task_to_wire(final_task)
 
     # ── Sending (the agent's reply path) ──────────────────────────────────
 
@@ -407,11 +618,33 @@ class A2AAdapter(BasePlatformAdapter):
         is_final_reply = bool((metadata or {}).get("notify"))
         with self._pending_lock:
             fut = self._pending_replies.get(chat_id)
+            task_id = self._pending_tasks.get(chat_id)
             if fut is not None and not fut.done():
                 if not is_final_reply:
                     logger.debug("A2A: ignoring non-final send for context %s", chat_id)
                     return SendResult(success=True, message_id=str(int(time.time() * 1000)))
-                fut.set_result(content or "")
+                if task_id:
+                    try:
+                        task, emitted = self._tasks.terminalize(
+                            task_id, protocol.STATE_COMPLETED,
+                            security.redact_outbound(content or ""),
+                        )
+                    except ControlPlaneError:
+                        logger.error("A2A: could not persist final reply for task %s", task_id,
+                                     exc_info=True)
+                        fut.set_exception(_TaskInterrupted("durable task completion failed"))
+                    else:
+                        if emitted:
+                            fut.set_result(task.get("result_text") or "")
+                        else:
+                            # A cancellation/deadline/restart has already won
+                            # the terminal ledger.  Do not turn it back into a
+                            # completion or emit a second notification.
+                            fut.set_exception(_TaskInterrupted("task already terminal"))
+                else:
+                    # Retain the adapter's historical direct-send behavior for
+                    # gateway/plugin callers that have no durable A2A task.
+                    fut.set_result(content or "")
                 return SendResult(success=True, message_id=str(int(time.time() * 1000)))
         # No waiter (e.g. a late streamed chunk or out-of-band send) — drop it.
         logger.debug("A2A: send() for context %s had no pending waiter", chat_id)
