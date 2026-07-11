@@ -127,6 +127,7 @@ def a2a_discover(args: dict, **_: Any) -> str:
     desc = card.get("description", "")
     caps = card.get("capabilities", {}) or {}
     skills = card.get("skills", []) or []
+    grants = card.get("x-hermes-capabilities", []) or []
     auth = "yes" if card.get("security") else "no"
     lines = [
         f"Agent: {name}",
@@ -137,6 +138,8 @@ def a2a_discover(args: dict, **_: Any) -> str:
     ]
     for s in skills[:20]:
         lines.append(f"  - {s.get('name', s.get('id', '?'))}: {s.get('description', '')}")
+    if grants:
+        lines.append("Hermes capabilities: " + ", ".join(str(v) for v in grants))
     return "\n".join(lines)
 
 

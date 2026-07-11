@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import FrozenSet, Optional
+from typing import Any, FrozenSet, Mapping, Optional
 
 
 @dataclass(frozen=True)
@@ -18,6 +18,7 @@ class ActivePolicy:
     on_behalf_of: str
     capability: str
     allowed_tools: FrozenSet[str]
+    tool_rules: Mapping[str, Mapping[str, FrozenSet[Any]]] | None = None
 
 
 _lock = threading.Lock()
@@ -43,7 +44,7 @@ def get(context_id: str) -> Optional[ActivePolicy]:
         return _active.get(context_id)
 
 
-def enforce_tool_scope(tool_name: str = "", **_: object):
+def enforce_tool_scope(tool_name: str = "", args: object = None, **_: object):
     """Block tools outside the active A2A request's capability grant.
 
     A missing policy for an A2A session fails closed.  ``*`` is retained only
@@ -68,12 +69,25 @@ def enforce_tool_scope(tool_name: str = "", **_: object):
             "action": "block",
             "message": "A2A tool denied: no active capability policy",
         }
-    if "*" in policy.allowed_tools or tool_name in policy.allowed_tools:
-        return None
-    return {
-        "action": "block",
-        "message": (
-            f"A2A tool '{tool_name}' denied: capability "
-            f"'{policy.capability}' does not grant it"
-        ),
-    }
+    if "*" not in policy.allowed_tools and tool_name not in policy.allowed_tools:
+        return {
+            "action": "block",
+            "message": (
+                f"A2A tool '{tool_name}' denied: capability "
+                f"'{policy.capability}' does not grant it"
+            ),
+        }
+
+    rules = (policy.tool_rules or {}).get(tool_name) or {}
+    actual = args if isinstance(args, dict) else {}
+    for field, allowed_values in rules.items():
+        value = actual.get(field)
+        if value not in allowed_values:
+            return {
+                "action": "block",
+                "message": (
+                    f"A2A tool '{tool_name}' denied: capability "
+                    f"'{policy.capability}' does not permit {field}={value!r}"
+                ),
+            }
+    return None

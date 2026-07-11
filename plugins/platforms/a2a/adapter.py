@@ -210,7 +210,7 @@ class A2AAdapter(BasePlatformAdapter):
             toolsets = list(extra.get("advertised_toolsets") or [])
         except Exception:
             pass
-        return protocol.build_agent_card(
+        card = protocol.build_agent_card(
             name=self.agent_name,
             url=f"http://{self.host}:{self.port}/",
             description=str(self.extra.get("agent_description") or os.getenv(
@@ -221,6 +221,10 @@ class A2AAdapter(BasePlatformAdapter):
             streaming=False,
             auth_required=not security.localhost_only(self.extra),
         )
+        grants = self.extra.get("capability_tools") or {}
+        if isinstance(grants, dict):
+            card["x-hermes-capabilities"] = sorted(str(name) for name in grants)
+        return card
 
     # ── Inbound task handling ─────────────────────────────────────────────
 
@@ -237,18 +241,32 @@ class A2AAdapter(BasePlatformAdapter):
 
         if identity.legacy:
             allowed_tools = frozenset({"*"})
+            tool_rules = None
         else:
             cap_tools = self.extra.get("capability_tools") or {}
             raw_tools = cap_tools.get(capability) if isinstance(cap_tools, dict) else None
             if raw_tools is None:
                 return None, "capability has no configured tool grant"
             allowed_tools = frozenset(str(v) for v in raw_tools)
+            raw_cap_rules = (self.extra.get("capability_tool_rules") or {}).get(
+                capability, {}
+            )
+            tool_rules = {}
+            if isinstance(raw_cap_rules, dict):
+                for tool_name, raw_rules in raw_cap_rules.items():
+                    if not isinstance(raw_rules, dict):
+                        continue
+                    tool_rules[str(tool_name)] = {
+                        str(field): frozenset(values if isinstance(values, list) else [values])
+                        for field, values in raw_rules.items()
+                    }
 
         return ActivePolicy(
             principal=identity.principal,
             on_behalf_of=on_behalf_of,
             capability=capability,
             allowed_tools=allowed_tools,
+            tool_rules=tool_rules,
         ), None
 
     def _handle_inbound_task(self, params: dict, policy: ActivePolicy) -> dict:

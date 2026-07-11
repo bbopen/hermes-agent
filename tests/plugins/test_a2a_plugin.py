@@ -470,6 +470,35 @@ class TestCapabilityEnforcement:
         )
         assert runtime_policy.enforce_tool_scope("terminal")["action"] == "block"
 
+    def test_argument_rules_restrict_multi_action_tools(self, monkeypatch):
+        values = {
+            "HERMES_SESSION_PLATFORM": "a2a",
+            "HERMES_SESSION_CHAT_ID": "ctx-observe",
+        }
+        monkeypatch.setattr(
+            "gateway.session_context.get_session_env",
+            lambda name, default="": values.get(name, default),
+        )
+        policy = runtime_policy.ActivePolicy(
+            principal="spark-primary",
+            on_behalf_of="brett",
+            capability="apple.read",
+            allowed_tools=frozenset({"computer_use"}),
+            tool_rules={"computer_use": {"action": frozenset({"capture", "list_apps"})}},
+        )
+        assert runtime_policy.activate("ctx-observe", policy)
+        try:
+            assert runtime_policy.enforce_tool_scope(
+                "computer_use", args={"action": "capture"}
+            ) is None
+            blocked = runtime_policy.enforce_tool_scope(
+                "computer_use", args={"action": "click"}
+            )
+            assert blocked["action"] == "block"
+            assert "action='click'" in blocked["message"]
+        finally:
+            runtime_policy.deactivate("ctx-observe")
+
 
 class TestRequestPolicy:
     def test_authenticated_identity_replaces_caller_peer(self, monkeypatch):
