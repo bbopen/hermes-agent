@@ -23,8 +23,10 @@ import logging
 import os
 import re
 import hashlib
+import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -68,6 +70,19 @@ class PeerIdentity:
     on_behalf_of: frozenset[str]
     capabilities: frozenset[str]
     legacy: bool = False
+    local: bool = False
+    key_id: str = ""
+
+
+@dataclass(frozen=True)
+class PeerCredential:
+    """One independent A2A bearer key, resolved only from its own key env."""
+
+    key_id: str
+    token: str
+
+
+_KEY_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 
 
 def _presented_bearer(auth_header: Optional[str]) -> str:
@@ -79,28 +94,105 @@ def _presented_bearer(auth_header: Optional[str]) -> str:
     return parts[1].strip()
 
 
-def configured_trusted_peers(extra: Mapping[str, Any]) -> list[tuple[PeerIdentity, str]]:
-    """Load non-secret peer policy and resolve each secret via ``token_env``."""
-    result: list[tuple[PeerIdentity, str]] = []
+def _expires_at(value: Any) -> Optional[float]:
+    """Parse an operator-supplied credential expiry, failing closed on errors."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        return -1.0
+    if isinstance(value, (int, float)):
+        # Treat values in milliseconds as such; normal Unix timestamps remain
+        # seconds.  It makes automated rotations unambiguous without requiring
+        # a second configuration field.
+        return float(value) / 1000 if value > 10_000_000_000 else float(value)
+    if not isinstance(value, str):
+        return -1.0
+    try:
+        if value.replace(".", "", 1).isdigit():
+            return _expires_at(float(value))
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(
+            tzinfo=datetime.fromisoformat(value.replace("Z", "+00:00")).tzinfo or timezone.utc
+        ).timestamp()
+    except (TypeError, ValueError):
+        return -1.0
+
+
+def _credential_specs(principal: str, raw: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    configured = raw.get("credentials")
+    if isinstance(configured, list):
+        return [entry for entry in configured if isinstance(entry, Mapping)]
+    # The old single token_env shape is retained only as a named explicit peer
+    # key.  It is never confused with inference/provider credentials.
+    if raw.get("token_env"):
+        return [{
+            "key_id": raw.get("key_id") or f"legacy-{principal}",
+            "token_env": raw.get("token_env"),
+            "expires_at": raw.get("expires_at"),
+            "revoked": raw.get("revoked", False),
+        }]
+    return []
+
+
+def configured_trusted_peers(
+    extra: Mapping[str, Any],
+) -> list[tuple[PeerIdentity, PeerCredential]]:
+    """Load current, non-revoked A2A keys on every request.
+
+    There is no credential cache: adding a second active key gives lossless
+    rotation overlap, and removing/revoking/expiring a key takes effect on the
+    next request.  Key ids are globally unambiguous to prevent a bearer token
+    from being attributed to the wrong principal after a hot config reload.
+    """
+    result: list[tuple[PeerIdentity, PeerCredential]] = []
     peers = extra.get("trusted_peers") or {}
     if not isinstance(peers, Mapping):
         return result
     for principal, raw in peers.items():
         if not isinstance(raw, Mapping) or raw.get("enabled", True) is False:
             continue
-        token_env = str(raw.get("token_env") or "").strip()
-        token = os.getenv(token_env, "").strip() if token_env else ""
-        if not token:
-            logger.warning("A2A: trusted peer %r has no usable token_env", principal)
-            continue
         obo = frozenset(str(v) for v in (raw.get("on_behalf_of") or []))
         caps = frozenset(str(v) for v in (raw.get("capabilities") or []))
-        result.append((PeerIdentity(str(principal), obo, caps), token))
-    return result
+        active_for_principal = 0
+        for spec in _credential_specs(str(principal), raw):
+            key_id = str(spec.get("key_id") or spec.get("id") or "").strip()
+            token_env = str(spec.get("token_env") or "").strip()
+            expires_at = _expires_at(spec.get("expires_at"))
+            if (
+                not _KEY_ID_RE.fullmatch(key_id)
+                or not token_env
+                or bool(spec.get("revoked", False))
+                or expires_at is not None and expires_at <= time.time()
+            ):
+                continue
+            token = os.getenv(token_env, "").strip()
+            if not token:
+                continue
+            active_for_principal += 1
+            result.append((
+                PeerIdentity(str(principal), obo, caps, key_id=key_id),
+                PeerCredential(key_id=key_id, token=token),
+            ))
+        if active_for_principal > 2:
+            logger.error("A2A: trusted peer %r has more than two active keys; rejecting it", principal)
+            result = [entry for entry in result if entry[0].principal != str(principal)]
+
+    duplicate_ids = {
+        credential.key_id
+        for _, credential in result
+        if sum(1 for _, candidate in result if candidate.key_id == credential.key_id) > 1
+    }
+    if duplicate_ids:
+        logger.error("A2A: duplicate trusted-peer key ids rejected: %s", sorted(duplicate_ids))
+    return [entry for entry in result if entry[1].key_id not in duplicate_ids]
+
+
+def _has_trusted_peer_config(extra: Mapping[str, Any]) -> bool:
+    peers = extra.get("trusted_peers") or {}
+    return isinstance(peers, Mapping) and bool(peers)
 
 
 def authenticate_bearer(
-    auth_header: Optional[str], extra: Mapping[str, Any]
+    auth_header: Optional[str], extra: Mapping[str, Any], key_id: Optional[str] = None,
 ) -> Optional[PeerIdentity]:
     """Return the identity bound to the presented bearer secret.
 
@@ -108,20 +200,30 @@ def authenticate_bearer(
     """
     configured = configured_trusted_peers(extra)
     presented = _presented_bearer(auth_header)
-    if configured:
+    if configured or _has_trusted_peer_config(extra):
         if not presented:
             return None
-        for identity, expected in configured:
-            if hmac.compare_digest(presented, expected):
-                return identity
-        return None
+        requested_key_id = str(key_id or "").strip()
+        candidates = [
+            (identity, credential) for identity, credential in configured
+            if not requested_key_id or credential.key_id == requested_key_id
+        ]
+        matches = [
+            identity for identity, credential in candidates
+            if hmac.compare_digest(presented, credential.token)
+        ]
+        return matches[0] if len(matches) == 1 else None
 
     # Backwards-compatible single-token and localhost modes.  They remain
     # useful for tests and local development but do not provide provenance.
     if not get_bearer_token():
-        return PeerIdentity("localhost", frozenset({"*"}), frozenset({"*"}), True)
+        return PeerIdentity(
+            "localhost", frozenset({"*"}), frozenset({"*"}), legacy=True, local=True,
+        )
     if check_bearer(auth_header):
-        return PeerIdentity("legacy-bearer", frozenset({"*"}), frozenset({"*"}), True)
+        # A historical global bearer never gains remote wildcard delegation.
+        # Operators must migrate it to trusted_peers with named keys/grants.
+        return PeerIdentity("legacy-bearer", frozenset(), frozenset(), legacy=True)
     return None
 
 
@@ -129,8 +231,10 @@ def authorize_claims(
     identity: PeerIdentity, on_behalf_of: str, capability: str
 ) -> Optional[str]:
     """Return an operator-safe denial reason, or ``None`` when authorized."""
-    if identity.legacy:
+    if identity.local:
         return None
+    if identity.legacy:
+        return "legacy bearer cannot authorize tasks; configure trusted_peers"
     if not on_behalf_of:
         return "on_behalf_of is required"
     if not capability:
@@ -143,10 +247,17 @@ def authorize_claims(
 
 
 def has_inbound_credentials(extra: Optional[Mapping[str, Any]] = None) -> bool:
-    """True when either trusted-peer or legacy bearer auth is configured."""
-    if extra and configured_trusted_peers(extra):
-        return True
-    return bool(get_bearer_token())
+    """True only for an active, explicit remote A2A key policy.
+
+    ``A2A_BEARER_TOKEN`` remains a localhost compatibility check; it cannot
+    widen the bind or imply any OBO/capability/tool grants.
+    """
+    return bool(extra and configured_trusted_peers(extra))
+
+
+def requires_auth(extra: Optional[Mapping[str, Any]] = None) -> bool:
+    """Whether the local HTTP edge requires an Authorization header."""
+    return has_inbound_credentials(extra) or bool(get_bearer_token())
 
 
 def localhost_only(extra: Optional[Mapping[str, Any]] = None) -> bool:
@@ -268,6 +379,9 @@ def _audit_path() -> Path:
     return base / "a2a_audit.jsonl"
 
 
+_AUDIT_LOCK = threading.Lock()
+
+
 def audit(
     direction: str,
     peer: str,
@@ -279,7 +393,11 @@ def audit(
     request_id: str = "",
     status: str = "",
 ) -> bool:
-    """Append an audit record. Best-effort — never raises into the caller."""
+    """Append a privacy-safe audit record with owner-only file permissions.
+
+    Callers use the return value to gate consequential dispatch.  Failure is
+    deliberately observable and must never silently downgrade task auditing.
+    """
     try:
         rec = {
             "ts": time.time(),
@@ -297,9 +415,25 @@ def audit(
             "body_sha256": hashlib.sha256((summary or "").encode("utf-8")).hexdigest(),
         }
         path = _audit_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        payload = (json.dumps(rec, ensure_ascii=False) + "\n").encode("utf-8")
+        with _AUDIT_LOCK:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(path.parent, 0o700)
+            except OSError:
+                pass
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                written = 0
+                while written < len(payload):
+                    count = os.write(fd, payload[written:])
+                    if count <= 0:
+                        raise OSError("short audit write")
+                    written += count
+                os.fsync(fd)
+            finally:
+                os.close(fd)
         return True
     except Exception:
         logger.debug("A2A: audit write failed", exc_info=True)

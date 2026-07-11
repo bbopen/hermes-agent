@@ -23,10 +23,13 @@ JSON-RPC ``message/send`` method, so any A2A-compliant peer works.
 from __future__ import annotations
 
 import json
+import ipaddress
 import logging
 import os
+import socket
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 from typing import Any, Optional
 
 from . import protocol, security
@@ -34,6 +37,88 @@ from . import protocol, security
 logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT = 120
+_MAX_OUTBOUND_REQUEST_BYTES = 256 * 1024
+_MAX_OUTBOUND_RESPONSE_BYTES = 512 * 1024
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow an A2A redirect with or without a bearer credential."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: N802
+        raise urllib.error.HTTPError(req.full_url, code, "A2A redirects are rejected", headers, fp)
+
+
+def _origin(url: str) -> str:
+    """Return a canonical http(s) origin or reject ambiguous peer URLs."""
+    parts = urlsplit(str(url or "").strip())
+    if parts.scheme not in {"http", "https"} or not parts.hostname:
+        raise ValueError("peer URL must be an absolute http(s) URL")
+    if parts.username or parts.password:
+        raise ValueError("peer URL must not contain userinfo")
+    try:
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError as exc:
+        raise ValueError("peer URL has an invalid port") from exc
+    host = parts.hostname.lower().rstrip(".")
+    return f"{parts.scheme}://{host}:{port}"
+
+
+def _is_non_public_host(host: str) -> bool:
+    """Conservatively classify local, metadata, and internal destinations."""
+    lowered = host.lower().rstrip(".")
+    if lowered in {"localhost", "localhost.localdomain"} or lowered.endswith(
+        (".localhost", ".local", ".internal")
+    ) or "." not in lowered:
+        return True
+    try:
+        return not ipaddress.ip_address(lowered).is_global
+    except ValueError:
+        pass
+    try:
+        addresses = {
+            item[4][0] for item in socket.getaddrinfo(lowered, None, type=socket.SOCK_STREAM)
+        }
+    except OSError as exc:
+        raise ValueError(f"peer host could not be resolved safely: {lowered}") from exc
+    if not addresses:
+        raise ValueError(f"peer host could not be resolved safely: {lowered}")
+    return any(not ipaddress.ip_address(address).is_global for address in addresses)
+
+
+def _validate_peer_url(
+    url: str,
+    *,
+    expected_origin: Optional[str] = None,
+    allow_configured_non_public: bool = False,
+) -> str:
+    """Pin a peer URL to its configured origin before issuing HTTP."""
+    actual_origin = _origin(url)
+    if expected_origin is not None and actual_origin != expected_origin:
+        raise ValueError("peer URL changed origin; refusing credential forwarding")
+    host = urlsplit(url).hostname or ""
+    if _is_non_public_host(host) and not allow_configured_non_public:
+        raise ValueError("private, loopback, link-local, or internal peer URLs require explicit configuration")
+    return actual_origin
+
+
+def _configured_origin_allowed(url: str, cfg: dict) -> bool:
+    """True only when this exact origin is already named in config.yaml."""
+    try:
+        target = _origin(url)
+    except ValueError:
+        return False
+    peers = cfg.get("a2a_agents") or {}
+    if not isinstance(peers, dict):
+        return False
+    for entry in peers.values():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            if _origin(str(entry.get("url") or "")) == target:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 # --------------------------------------------------------------------------
@@ -51,7 +136,7 @@ def _load_config() -> dict:
 def _resolve_peer(agent: str) -> Optional[dict]:
     """Resolve a peer name to {url, auth, timeout}, or treat ``agent`` as a URL."""
     if agent.startswith("http://") or agent.startswith("https://"):
-        return {"url": agent, "auth": {}, "timeout": _DEFAULT_TIMEOUT}
+        return {"url": agent, "auth": {}, "timeout": _DEFAULT_TIMEOUT, "configured": False}
     cfg = _load_config()
     peers = cfg.get("a2a_agents") or {}
     entry = peers.get(agent)
@@ -63,6 +148,7 @@ def _resolve_peer(agent: str) -> Optional[dict]:
         "timeout": int(entry.get("timeout", _DEFAULT_TIMEOUT)),
         "on_behalf_of": str(entry.get("on_behalf_of") or ""),
         "capability": str(entry.get("capability") or ""),
+        "configured": True,
     }
 
 
@@ -74,7 +160,11 @@ def _auth_header(auth: dict) -> dict:
         # configurations must use key_env so secrets stay in the profile .env.
         token = token or str(auth.get("token") or "").strip()
         if token:
-            return {"Authorization": f"Bearer {token}"}
+            headers = {"Authorization": f"Bearer {token}"}
+            key_id = str(auth.get("key_id") or auth.get("credential_id") or "").strip()
+            if key_id:
+                headers["X-A2A-Key-Id"] = key_id
+            return headers
     return {}
 
 
@@ -84,16 +174,26 @@ def _auth_header(auth: dict) -> dict:
 
 def _http_get_json(url: str, headers: dict, timeout: int) -> dict:
     req = urllib.request.Request(url, headers=headers, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (configured peers)
-        return json.loads(resp.read().decode("utf-8"))
+    opener = urllib.request.build_opener(_NoRedirect())
+    with opener.open(req, timeout=timeout) as resp:  # noqa: S310 (validated configured peers)
+        raw = resp.read(_MAX_OUTBOUND_RESPONSE_BYTES + 1)
+        if len(raw) > _MAX_OUTBOUND_RESPONSE_BYTES:
+            raise ValueError("peer response is too large")
+        return json.loads(raw.decode("utf-8"))
 
 
 def _http_post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
     data = json.dumps(body).encode("utf-8")
+    if len(data) > _MAX_OUTBOUND_REQUEST_BYTES:
+        raise ValueError("A2A request is too large")
     hdrs = {"Content-Type": "application/json", **headers}
     req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (configured peers)
-        return json.loads(resp.read().decode("utf-8"))
+    opener = urllib.request.build_opener(_NoRedirect())
+    with opener.open(req, timeout=timeout) as resp:  # noqa: S310 (validated configured peers)
+        raw = resp.read(_MAX_OUTBOUND_RESPONSE_BYTES + 1)
+        if len(raw) > _MAX_OUTBOUND_RESPONSE_BYTES:
+            raise ValueError("peer response is too large")
+        return json.loads(raw.decode("utf-8"))
 
 
 def _card_url(base_url: str) -> str:
@@ -116,12 +216,33 @@ def a2a_discover(args: dict, **_: Any) -> str:
     url = str(args.get("url") or "").strip()
     if not url:
         return "Error: 'url' is required (e.g. http://localhost:9999)."
+    cfg = _load_config()
+    try:
+        origin = _origin(url)
+        allow_private = _configured_origin_allowed(url, cfg)
+        _validate_peer_url(
+            url, expected_origin=origin, allow_configured_non_public=allow_private,
+        )
+    except ValueError as e:
+        return f"Error: unsafe peer URL — {e}."
     try:
         card = _http_get_json(_card_url(url), {}, _DEFAULT_TIMEOUT)
     except urllib.error.HTTPError as e:
         return f"Error: discovery failed — HTTP {e.code} from {url}."
     except Exception as e:
         return f"Error: could not reach {url} — {e}."
+
+    if not isinstance(card, dict):
+        return "Error: peer returned an invalid Agent Card."
+    advertised = card.get("url")
+    if advertised:
+        try:
+            _validate_peer_url(
+                str(advertised), expected_origin=origin,
+                allow_configured_non_public=allow_private,
+            )
+        except ValueError as e:
+            return f"Error: peer Agent Card was rejected — {e}."
 
     name = card.get("name", "?")
     desc = card.get("description", "")
@@ -166,6 +287,15 @@ def a2a_call(args: dict, **_: Any) -> str:
         )
 
     base_url = peer["url"]
+    try:
+        peer_origin = _origin(base_url)
+        _validate_peer_url(
+            base_url,
+            expected_origin=peer_origin,
+            allow_configured_non_public=bool(peer.get("configured")),
+        )
+    except ValueError as e:
+        return f"Error: unsafe peer URL — {e}."
     headers = _auth_header(peer["auth"])
     timeout = peer["timeout"]
     on_behalf_of = on_behalf_of or peer.get("on_behalf_of", "")
@@ -175,8 +305,23 @@ def a2a_call(args: dict, **_: Any) -> str:
     card = None
     try:
         card = _http_get_json(_card_url(base_url), headers, min(timeout, 30))
+    except urllib.error.HTTPError as e:
+        if 300 <= e.code < 400:
+            return f"Error: peer '{agent}' redirected its Agent Card; redirects are refused."
     except Exception:
         pass
+
+    if card is not None and not isinstance(card, dict):
+        return f"Error: peer '{agent}' returned an invalid Agent Card."
+    try:
+        rpc_url = _rpc_url(base_url, card)
+        _validate_peer_url(
+            rpc_url,
+            expected_origin=peer_origin,
+            allow_configured_non_public=bool(peer.get("configured")),
+        )
+    except ValueError as e:
+        return f"Error: peer '{agent}' Agent Card was rejected — {e}."
 
     ctx = context_id or protocol.new_context_id()
     safe_message = security.redact_outbound(message)
@@ -197,7 +342,9 @@ def a2a_call(args: dict, **_: Any) -> str:
     protocol.persist_message(ctx, "user", safe_message, rpc_body["id"])
 
     try:
-        resp = _http_post_json(_rpc_url(base_url, card), rpc_body, headers, timeout)
+        # The credential-bearing request is issued only after the final RPC
+        # target has passed the exact configured-origin pin above.
+        resp = _http_post_json(rpc_url, rpc_body, headers, timeout)
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
             return f"Error: peer '{agent}' rejected auth (HTTP {e.code}). Check the configured token."

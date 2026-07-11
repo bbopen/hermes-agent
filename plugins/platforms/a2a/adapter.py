@@ -29,6 +29,7 @@ import re
 import threading
 import time
 from concurrent.futures import Future
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
 
@@ -58,6 +59,8 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_PORT = 9900
 _REPLY_TIMEOUT = 300  # seconds to wait for the agent to answer an inbound task
+_DEFAULT_MAX_REQUEST_BYTES = 128 * 1024
+_DEFAULT_MAX_INFLIGHT_REQUESTS = 16
 
 
 class _AgentShuttingDown(RuntimeError):
@@ -82,6 +85,49 @@ def _default_agent_name(extra: Optional[dict] = None) -> str:
         return "hermes-agent"
 
 
+def _bounded_int(value: Any, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        return min(maximum, max(minimum, int(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """Bound live request workers before stdlib can create unbounded threads."""
+
+    daemon_threads = True
+
+    def __init__(self, *args, max_inflight: int, **kwargs) -> None:
+        self._request_slots = threading.BoundedSemaphore(max_inflight)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):  # noqa: D401
+        if not self._request_slots.acquire(blocking=False):
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Connection: close\r\nContent-Length: 0\r\n\r\n"
+                )
+            except OSError:
+                pass
+            try:
+                request.close()
+            except OSError:
+                pass
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
+
+
 class A2AAdapter(BasePlatformAdapter):
     """Inbound A2A server adapter."""
 
@@ -95,6 +141,14 @@ class A2AAdapter(BasePlatformAdapter):
         self.agent_name = _default_agent_name(extra)
         self.extra = extra
         self.reply_timeout = max(1, int(extra.get("reply_timeout", _REPLY_TIMEOUT)))
+        self.max_request_bytes = _bounded_int(
+            extra.get("max_request_bytes", _DEFAULT_MAX_REQUEST_BYTES),
+            _DEFAULT_MAX_REQUEST_BYTES, minimum=1024, maximum=1024 * 1024,
+        )
+        self.max_inflight_requests = _bounded_int(
+            extra.get("max_inflight_requests", _DEFAULT_MAX_INFLIGHT_REQUESTS),
+            _DEFAULT_MAX_INFLIGHT_REQUESTS, minimum=1, maximum=128,
+        )
 
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._server_thread: Optional[threading.Thread] = None
@@ -110,6 +164,7 @@ class A2AAdapter(BasePlatformAdapter):
         self._pending_replies: Dict[str, Future] = {}
         self._pending_tasks: Dict[str, str] = {}
         self._active_tasks: Dict[str, str] = {}
+        self._active_session_keys: Dict[str, str] = {}
         self._pending_lock = threading.Lock()
 
     @property
@@ -174,25 +229,51 @@ class A2AAdapter(BasePlatformAdapter):
                 self._json(404, {"error": "not found"})
 
             def do_POST(self):  # noqa: N802
+                content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+                if content_type != "application/json":
+                    self._json(415, protocol.jsonrpc_error(None, -32600, "Content-Type must be application/json"))
+                    return
+                raw_length = self.headers.get("Content-Length")
+                if raw_length is None:
+                    self._json(411, protocol.jsonrpc_error(None, -32600, "Content-Length is required"))
+                    return
+                try:
+                    length = int(raw_length)
+                except (TypeError, ValueError):
+                    self._json(400, protocol.jsonrpc_error(None, -32600, "invalid Content-Length"))
+                    return
+                if length < 1 or length > adapter.max_request_bytes:
+                    self.close_connection = True
+                    self._json(413, protocol.jsonrpc_error(None, -32600, "request body is too large"))
+                    return
                 # Auth (only meaningful when a token is configured; otherwise
                 # we are localhost-only by construction).
                 identity = security.authenticate_bearer(
-                    self.headers.get("Authorization"), adapter.extra
+                    self.headers.get("Authorization"), adapter.extra,
+                    self.headers.get("X-A2A-Key-Id"),
                 )
                 if identity is None:
                     self._json(401, protocol.jsonrpc_error(None, -32001, "unauthorized"))
                     return
                 try:
-                    length = int(self.headers.get("Content-Length", 0))
-                    raw = self.rfile.read(length) if length else b"{}"
+                    raw = self.rfile.read(length)
+                    if len(raw) != length:
+                        raise ValueError("incomplete request body")
                     req = json.loads(raw.decode("utf-8"))
                 except Exception:
                     self._json(400, protocol.jsonrpc_error(None, -32700, "parse error"))
                     return
 
+                if not isinstance(req, dict):
+                    self._json(400, protocol.jsonrpc_error(None, -32600, "request must be an object"))
+                    return
+
                 req_id = req.get("id")
                 method = req.get("method", "")
                 params = req.get("params", {}) or {}
+                if not isinstance(method, str) or not isinstance(params, dict):
+                    self._json(400, protocol.jsonrpc_error(req_id, -32600, "invalid JSON-RPC request"))
+                    return
 
                 if method in ("message/send", "message/stream"):
                     policy, denial = adapter._request_policy(params, identity)
@@ -238,7 +319,7 @@ class A2AAdapter(BasePlatformAdapter):
                             principal=policy.principal,
                             on_behalf_of=policy.on_behalf_of,
                             capability=policy.capability,
-                            enforce_capability=not identity.legacy,
+                            enforce_capability=not identity.local,
                         )
                     except TaskAccessDenied:
                         self._json(403, protocol.jsonrpc_error(
@@ -250,10 +331,43 @@ class A2AAdapter(BasePlatformAdapter):
                         return
                     self._json(200, protocol.jsonrpc_result(req_id, task_to_wire(task)))
                     return
+                if method == "tasks/cancel":
+                    policy, denial = adapter._request_policy(params, identity)
+                    if denial:
+                        self._json(403, protocol.jsonrpc_error(req_id, -32003, denial))
+                        return
+                    task_id = str(params.get("taskId") or params.get("id") or "").strip()
+                    if not _SAFE_EXTERNAL_ID.fullmatch(task_id):
+                        self._json(400, protocol.jsonrpc_error(req_id, -32602, "valid task id is required"))
+                        return
+                    try:
+                        task, emitted = adapter._tasks.request_cancel(
+                            task_id,
+                            principal=policy.principal,
+                            on_behalf_of=policy.on_behalf_of,
+                            capability=policy.capability,
+                            backstop="gateway.cancel_session_processing",
+                        )
+                    except TaskAccessDenied:
+                        self._json(403, protocol.jsonrpc_error(
+                            req_id, -32003, "task is not authorized for this delegation",
+                        ))
+                        return
+                    if emitted:
+                        security.audit(
+                            "terminal", policy.principal, task_id, "",
+                            on_behalf_of=policy.on_behalf_of, capability=policy.capability,
+                            request_id=task["request_key"], status=task["state"],
+                        )
+                        adapter._interrupt_task(task_id)
+                    self._json(200, protocol.jsonrpc_result(req_id, task_to_wire(task)))
+                    return
                 self._json(200, protocol.jsonrpc_error(req_id, -32601, f"method not found: {method}"))
 
         try:
-            self._httpd = ThreadingHTTPServer((self.host, self.port), _Handler)
+            self._httpd = _BoundedThreadingHTTPServer(
+                (self.host, self.port), _Handler, max_inflight=self.max_inflight_requests,
+            )
         except OSError as e:
             logger.error("A2A: could not bind %s:%s — %s", self.host, self.port, e)
             self._set_fatal_error("bind_failed", f"A2A bind failed: {e}", retryable=True)
@@ -291,6 +405,7 @@ class A2AAdapter(BasePlatformAdapter):
             self._pending_replies.clear()
             self._pending_tasks.clear()
             self._active_tasks.clear()
+            self._active_session_keys.clear()
 
     # ── Agent Card ────────────────────────────────────────────────────────
 
@@ -310,7 +425,7 @@ class A2AAdapter(BasePlatformAdapter):
             )),
             skills=protocol.skills_from_toolsets(toolsets),
             streaming=False,
-            auth_required=not security.localhost_only(self.extra),
+            auth_required=security.requires_auth(self.extra),
         )
         grants = self.extra.get("capability_tools") or {}
         if isinstance(grants, dict):
@@ -337,7 +452,7 @@ class A2AAdapter(BasePlatformAdapter):
         if denial:
             return None, denial
 
-        if identity.legacy:
+        if identity.local:
             allowed_tools = frozenset({"*"})
             tool_rules = None
         else:
@@ -393,6 +508,53 @@ class A2AAdapter(BasePlatformAdapter):
         if value and (not isinstance(value, str) or not _SAFE_EXTERNAL_ID.fullmatch(value)):
             raise ValueError("contextId must contain only letters, digits, '_' or '-'")
         return str(value or "")
+
+    @staticmethod
+    def _deadline(params: dict) -> Optional[float]:
+        """Parse a request deadline as Unix seconds/milliseconds or RFC3339."""
+        message = params.get("message") or {}
+        metadata = message.get("metadata") if isinstance(message, dict) else None
+        metadata = metadata if isinstance(metadata, dict) else {}
+        raw = params.get("deadline", metadata.get("deadline"))
+        if raw in (None, ""):
+            return None
+        if isinstance(raw, bool):
+            raise ValueError("deadline must be a timestamp")
+        if isinstance(raw, (int, float)):
+            value = float(raw)
+            return value / 1000 if value > 10_000_000_000 else value
+        if not isinstance(raw, str):
+            raise ValueError("deadline must be a timestamp")
+        try:
+            if raw.replace(".", "", 1).isdigit():
+                return A2AAdapter._deadline({"deadline": float(raw)})
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                raise ValueError("deadline must include a timezone")
+            return parsed.timestamp()
+        except ValueError as exc:
+            raise ValueError("deadline must be Unix time or RFC3339") from exc
+
+    def _interrupt_task(self, task_id: str) -> None:
+        """Cooperatively interrupt the gateway and use its cancellation backstop."""
+        with self._pending_lock:
+            context_id = self._active_tasks.get(task_id)
+            fut = self._pending_replies.get(context_id) if context_id else None
+            session_key = self._active_session_keys.get(task_id)
+            if fut is not None and not fut.done():
+                fut.set_exception(_TaskInterrupted("task cancellation requested"))
+        if self._loop is None or not session_key:
+            return
+        try:
+            cancel = asyncio.run_coroutine_threadsafe(
+                self.cancel_session_processing(session_key), self._loop,
+            )
+            cancel.result(timeout=5)
+        except Exception:
+            # Durable cancellation intent is already terminal.  The gateway
+            # method is a best-effort process/session backstop where available.
+            logger.warning("A2A: gateway cancellation backstop failed for task %s", task_id,
+                           exc_info=True)
 
     def _finish_task(
         self,
@@ -451,6 +613,7 @@ class A2AAdapter(BasePlatformAdapter):
             # tasks.  Consequential task delivery needs an explicit stable id.
             raise ValueError("messageId or idempotencyKey is required")
         requested_context_id = self._context_id(params)
+        deadline_at = self._deadline(params)
         text = protocol.extract_text(params)
         peer = policy.principal
         task_id = protocol.new_task_id()
@@ -467,7 +630,7 @@ class A2AAdapter(BasePlatformAdapter):
             payload_sha256=canonical_payload_sha256(payload),
             requested_context_id=requested_context_id,
             task_id=task_id,
-            deadline_at=None,
+            deadline_at=deadline_at,
         )
         if not created:
             return task_to_wire(self._wait_for_task(task["task_id"], self.reply_timeout))
@@ -481,19 +644,31 @@ class A2AAdapter(BasePlatformAdapter):
                 policy=policy, request_id=request_id,
             ))
 
+        if deadline_at is not None and deadline_at <= time.time():
+            return task_to_wire(self._finish_task(
+                task_id, protocol.STATE_FAILED, "[task deadline elapsed before dispatch]",
+                policy=policy, request_id=request_id,
+            ))
+
         framed = security.wrap_inbound(
             peer,
             text,
             on_behalf_of=policy.on_behalf_of,
             capability=policy.capability,
         )
-        security.audit(
+        if not security.audit(
             "inbound", peer, task_id, "",
             on_behalf_of=policy.on_behalf_of,
             capability=policy.capability,
             request_id=request_id,
             status=protocol.STATE_WORKING,
-        )
+        ):
+            # Consequential execution never proceeds without its durable audit
+            # record.  Returning a terminal failure also makes a retry stable.
+            return task_to_wire(self._finish_task(
+                task_id, protocol.STATE_FAILED, "[audit persistence unavailable]",
+                policy=policy, request_id=request_id,
+            ))
         protocol.persist_message(context_id, "user", text, task_id)
 
         if self._loop is None or self._message_handler is None:
@@ -531,6 +706,13 @@ class A2AAdapter(BasePlatformAdapter):
             ),
             message_id=task_id,
         )
+        session_key = build_session_key(
+            event.source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+        with self._pending_lock:
+            self._active_session_keys[task_id] = session_key
 
         try:
             asyncio.run_coroutine_threadsafe(self.handle_message(event), self._loop)
@@ -539,6 +721,7 @@ class A2AAdapter(BasePlatformAdapter):
                 self._pending_replies.pop(context_id, None)
                 self._pending_tasks.pop(context_id, None)
                 self._active_tasks.pop(task_id, None)
+                self._active_session_keys.pop(task_id, None)
             deactivate(context_id)
             return task_to_wire(self._finish_task(
                 task_id, protocol.STATE_FAILED, f"Dispatch failed: {e}",
@@ -546,47 +729,42 @@ class A2AAdapter(BasePlatformAdapter):
             ))
 
         try:
-            fut.result(timeout=self.reply_timeout)
+            wait_timeout = self.reply_timeout
+            if deadline_at is not None:
+                wait_timeout = max(0.0, min(wait_timeout, deadline_at - time.time()))
+            if wait_timeout <= 0:
+                raise TimeoutError("task deadline elapsed")
+            fut.result(timeout=wait_timeout)
         except _AgentShuttingDown:
             self._finish_task(
                 task_id, protocol.STATE_FAILED, "[agent shutting down]",
                 policy=policy, request_id=request_id,
             )
+        except _TaskInterrupted:
+            # tasks/cancel or a deadline has already written the authoritative
+            # terminal record; never overwrite it with a late completion.
+            pass
         except Exception:
+            deadline_text = (
+                "[task deadline exceeded]" if deadline_at is not None and deadline_at <= time.time()
+                else "[agent did not reply in time]"
+            )
             self._finish_task(
-                task_id, protocol.STATE_FAILED, "[agent did not reply in time]",
+                task_id, protocol.STATE_FAILED, deadline_text,
                 policy=policy, request_id=request_id,
             )
             # A timeout is an execution boundary, not only an HTTP waiting
             # boundary. Cancel the gateway session so the model cannot keep
             # running tools after the caller has given up and the capability
             # policy has been removed.
-            try:
-                session_key = build_session_key(
-                    event.source,
-                    group_sessions_per_user=self.config.extra.get(
-                        "group_sessions_per_user", True
-                    ),
-                    thread_sessions_per_user=self.config.extra.get(
-                        "thread_sessions_per_user", False
-                    ),
-                )
-                cancel = asyncio.run_coroutine_threadsafe(
-                    self.cancel_session_processing(session_key), self._loop
-                )
-                cancel.result(timeout=5)
-            except Exception:
-                logger.warning(
-                    "A2A: timed-out session cancellation failed for context %s",
-                    context_id,
-                    exc_info=True,
-                )
+            self._interrupt_task(task_id)
         finally:
             with self._pending_lock:
                 if self._pending_replies.get(context_id) is fut:
                     self._pending_replies.pop(context_id, None)
                     self._pending_tasks.pop(context_id, None)
                 self._active_tasks.pop(task_id, None)
+                self._active_session_keys.pop(task_id, None)
             deactivate(context_id)
 
         final_task = self._tasks.get_task(task_id, enforce_capability=False)
@@ -635,6 +813,12 @@ class A2AAdapter(BasePlatformAdapter):
                         fut.set_exception(_TaskInterrupted("durable task completion failed"))
                     else:
                         if emitted:
+                            security.audit(
+                                "terminal", task["principal"], task_id, "",
+                                on_behalf_of=task["on_behalf_of"],
+                                capability=task["capability"],
+                                request_id=task["request_key"], status=task["state"],
+                            )
                             fut.set_result(task.get("result_text") or "")
                         else:
                             # A cancellation/deadline/restart has already won

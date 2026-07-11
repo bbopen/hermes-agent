@@ -11,8 +11,10 @@ import asyncio
 from concurrent.futures import Future
 import json
 import os
+import stat
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -44,11 +46,24 @@ class TestBindSafety:
         # No token => refuse to widen, stay on loopback.
         assert security.resolve_bind_host() == "127.0.0.1"
 
-    def test_host_widens_only_with_token(self, monkeypatch):
+    def test_legacy_bearer_does_not_widen_bind(self, monkeypatch):
         monkeypatch.setenv("A2A_BEARER_TOKEN", "secret-token-123")
         monkeypatch.setenv("A2A_HOST", "0.0.0.0")
-        assert security.localhost_only() is False
-        assert security.resolve_bind_host() == "0.0.0.0"
+        assert security.localhost_only() is True
+        assert security.resolve_bind_host() == "127.0.0.1"
+
+    def test_remote_bind_requires_usable_explicit_peer_credential(self, monkeypatch):
+        monkeypatch.setenv("SPARK_A2A_TOKEN", "peer-secret")
+        extra = {
+            "host": "0.0.0.0",
+            "trusted_peers": {"spark-primary": {
+                "credentials": [{"key_id": "spark-2026-07", "token_env": "SPARK_A2A_TOKEN"}],
+                "on_behalf_of": ["brett"],
+                "capabilities": ["system.proof"],
+            }},
+        }
+        assert security.localhost_only(extra) is False
+        assert security.resolve_bind_host(extra) == "0.0.0.0"
 
     def test_loopback_host_allowed_without_token(self, monkeypatch):
         monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
@@ -111,6 +126,40 @@ class TestBearerAuth:
         assert security.authorize_claims(identity, "brett", "mail.send")
         assert security.authenticate_bearer("Bearer wrong", extra) is None
 
+    def test_two_key_overlap_hot_reload_and_key_lifecycle(self, monkeypatch):
+        monkeypatch.setenv("A2A_PEER_KEY_A", "old-key")
+        monkeypatch.setenv("A2A_PEER_KEY_B", "new-key")
+        extra = {"trusted_peers": {"peer": {
+            "credentials": [
+                {"key_id": "key-a", "token_env": "A2A_PEER_KEY_A"},
+                {"key_id": "key-b", "token_env": "A2A_PEER_KEY_B"},
+            ],
+            "on_behalf_of": ["brett"],
+            "capabilities": ["system.proof"],
+        }}}
+        first = security.authenticate_bearer("Bearer old-key", extra, "key-a")
+        second = security.authenticate_bearer("Bearer new-key", extra, "key-b")
+        assert first is not None and first.key_id == "key-a"
+        assert second is not None and second.key_id == "key-b"
+
+        # No credential cache: an operator can rotate an env-backed key
+        # without dropping the still-valid overlap key.
+        monkeypatch.setenv("A2A_PEER_KEY_A", "rotated-key")
+        assert security.authenticate_bearer("Bearer old-key", extra, "key-a") is None
+        assert security.authenticate_bearer("Bearer rotated-key", extra, "key-a") is not None
+
+        extra["trusted_peers"]["peer"]["credentials"][0]["revoked"] = True
+        extra["trusted_peers"]["peer"]["credentials"][1]["expires_at"] = time.time() - 1
+        assert security.authenticate_bearer("Bearer rotated-key", extra, "key-a") is None
+        assert security.authenticate_bearer("Bearer new-key", extra, "key-b") is None
+
+    def test_legacy_bearer_has_no_remote_wildcard_grant(self, monkeypatch):
+        monkeypatch.setenv("A2A_BEARER_TOKEN", "legacy-secret")
+        identity = security.authenticate_bearer("Bearer legacy-secret", {})
+        assert identity is not None
+        assert identity.legacy is True and identity.local is False
+        assert security.authorize_claims(identity, "brett", "system.proof")
+
 
 class TestInjectionFilter:
     def test_chatml_defanged(self):
@@ -170,6 +219,25 @@ class TestAudit:
         assert rec["peer"] == "peer-y"
         assert rec["task_id"] == "task-1"
 
+    def test_audit_is_owner_only_and_contains_no_prompt_body(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        secret_prompt = "sensitive prompt body must not be retained"
+        assert security.audit(
+            "inbound", "peer", "task", secret_prompt,
+            on_behalf_of="brett", capability="system.proof",
+            request_id="message-1", status="working",
+        ) is True
+        audit_file = tmp_path / "a2a_audit.jsonl"
+        assert stat.S_IMODE(audit_file.stat().st_mode) == 0o600
+        raw = audit_file.read_text()
+        assert secret_prompt not in raw
+        rec = json.loads(raw)
+        assert rec["principal"] == "peer"
+        assert rec["on_behalf_of"] == "brett"
+        assert rec["capability"] == "system.proof"
+        assert rec["request_id"] == "message-1"
+        assert rec["status"] == "working"
+
 
 # --------------------------------------------------------------------------
 # Protocol
@@ -182,7 +250,7 @@ class TestAgentCard:
             description="test", skills=[], streaming=False, auth_required=False,
         )
         assert card["name"] == "hermes-test"
-        assert card["protocolVersion"] == "0.3"
+        assert card["protocolVersion"] == "1.0"
         assert card["capabilities"]["streaming"] is False
         assert "security" not in card
 
@@ -357,6 +425,9 @@ class TestClientTools:
         assert "unknown agent" in out
 
     def test_discover_summarizes_card(self, monkeypatch):
+        monkeypatch.setattr(tools, "_load_config", lambda: {
+            "a2a_agents": {"researcher": {"url": "http://localhost:9999"}},
+        })
         card = protocol.build_agent_card(
             name="researcher", url="http://localhost:9999/",
             description="finds things",
@@ -366,6 +437,46 @@ class TestClientTools:
         out = tools.a2a_discover({"url": "http://localhost:9999"})
         assert "researcher" in out
         assert "search" in out
+
+    @pytest.mark.parametrize("url", [
+        "http://127.0.0.1:9900",
+        "http://10.0.0.8:9900",
+        "http://169.254.169.254/latest/meta-data",
+        "http://localhost:9900",
+        "http://worker.internal:9900",
+    ])
+    def test_unconfigured_nonpublic_discovery_is_rejected(self, monkeypatch, url):
+        monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {}})
+        monkeypatch.setattr(tools, "_http_get_json", lambda *args: (_ for _ in ()).throw(
+            AssertionError("unsafe target reached transport")
+        ))
+        assert "unsafe peer URL" in tools.a2a_discover({"url": url})
+
+    def test_configured_private_origin_is_allowed_but_cross_origin_card_is_rejected(self, monkeypatch):
+        monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {
+            "private-worker": {"url": "http://127.0.0.1:9900"},
+        }})
+        monkeypatch.setattr(tools, "_http_get_json", lambda *args: {
+            "name": "worker", "url": "http://evil.example:9900/",
+        })
+        posted = []
+        monkeypatch.setattr(tools, "_http_post_json", lambda *args: posted.append(args))
+        out = tools.a2a_call({"agent": "private-worker", "message": "hello"})
+        assert "Agent Card was rejected" in out
+        assert posted == []
+
+    def test_agent_card_redirect_is_rejected_before_post(self, monkeypatch):
+        monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {
+            "private-worker": {"url": "http://127.0.0.1:9900"},
+        }})
+        redirect = urllib.error.HTTPError("http://127.0.0.1:9900/.well-known/agent.json",
+                                           302, "redirect", {}, None)
+        monkeypatch.setattr(tools, "_http_get_json", lambda *args: (_ for _ in ()).throw(redirect))
+        posted = []
+        monkeypatch.setattr(tools, "_http_post_json", lambda *args: posted.append(args))
+        out = tools.a2a_call({"agent": "private-worker", "message": "hello"})
+        assert "redirected" in out
+        assert posted == []
 
     def test_call_returns_reply_and_redacts_outbound(self, monkeypatch):
         monkeypatch.setattr(tools, "_load_config",
@@ -647,6 +758,199 @@ class TestRequestPolicy:
         policy, denial = adapter._request_policy(params, identity)
         assert policy is None
         assert denial == "capability has no configured tool grant"
+
+
+class TestTaskTerminalControls:
+    def _adapter(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from gateway.config import PlatformConfig
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        return A2AAdapter(PlatformConfig(enabled=True))
+
+    @staticmethod
+    def _policy():
+        return runtime_policy.ActivePolicy(
+            principal="localhost", on_behalf_of="", capability="",
+            allowed_tools=frozenset({"*"}),
+        )
+
+    def test_audit_failure_fails_closed_before_dispatch(self, monkeypatch, tmp_path):
+        adapter = self._adapter(monkeypatch, tmp_path)
+        monkeypatch.setattr(security, "audit", lambda *args, **kwargs: False)
+        params = {"message": protocol.text_message("user", "consequential action")}
+        result = adapter._handle_inbound_task(params, self._policy(), "rpc-audit")
+        assert result["status"]["state"] == protocol.STATE_FAILED
+        assert "audit persistence unavailable" in protocol.extract_text(result["artifacts"][0])
+
+    def test_elapsed_deadline_is_terminal_before_dispatch(self, monkeypatch, tmp_path):
+        adapter = self._adapter(monkeypatch, tmp_path)
+        params = {
+            "deadline": time.time() - 1,
+            "message": protocol.text_message("user", "deadline task"),
+        }
+        result = adapter._handle_inbound_task(params, self._policy(), "rpc-deadline")
+        assert result["status"]["state"] == protocol.STATE_FAILED
+        assert "deadline elapsed" in protocol.extract_text(result["artifacts"][0])
+
+    def test_cancel_intent_suppresses_late_terminal_reply(self, monkeypatch, tmp_path):
+        adapter = self._adapter(monkeypatch, tmp_path)
+        task, _ = adapter._tasks.claim_request(
+            principal="localhost", on_behalf_of="", capability="", request_key="cancel-msg",
+            payload_sha256=canonical_payload_sha256({"message": "cancel"}),
+            requested_context_id="ctx-cancel", task_id=protocol.new_task_id(), deadline_at=None,
+        )
+        fut = Future()
+        with adapter._pending_lock:
+            adapter._pending_replies["ctx-cancel"] = fut
+            adapter._pending_tasks["ctx-cancel"] = task["task_id"]
+            adapter._active_tasks[task["task_id"]] = "ctx-cancel"
+
+        canceled, emitted = adapter._tasks.request_cancel(
+            task["task_id"], principal="localhost", on_behalf_of="", capability="",
+            backstop="gateway.cancel_session_processing",
+        )
+        assert emitted is True
+        adapter._interrupt_task(task["task_id"])
+        asyncio.run(adapter.send("ctx-cancel", "late reply", metadata={"notify": True}))
+        current = adapter._tasks.get_task(task["task_id"], enforce_capability=False)
+        assert canceled["state"] == current["state"] == protocol.STATE_CANCELED
+        assert current["result_text"] != "late reply"
+        assert adapter._tasks.terminal_event_count(task["task_id"]) == 1
+
+
+@pytest.mark.integration
+class TestPrincipalBoundTaskHTTP:
+    def test_task_get_context_and_request_ownership_over_real_http(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("A2A_PEER_A", "token-a")
+        monkeypatch.setenv("A2A_PEER_B", "token-b")
+        monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
+        monkeypatch.delenv("A2A_HOST", raising=False)
+
+        import socket
+        from gateway.config import PlatformConfig
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        monkeypatch.setenv("A2A_PORT", str(port))
+
+        metadata = {"on_behalf_of": "brett", "capability": "system.proof"}
+        cfg = PlatformConfig(enabled=True, extra={
+            "trusted_peers": {
+                "peer-a": {
+                    "credentials": [{"key_id": "a-current", "token_env": "A2A_PEER_A"}],
+                    "on_behalf_of": ["brett"], "capabilities": ["system.proof"],
+                },
+                "peer-b": {
+                    "credentials": [{"key_id": "b-current", "token_env": "A2A_PEER_B"}],
+                    "on_behalf_of": ["brett"], "capabilities": ["system.proof"],
+                },
+            },
+            "capability_tools": {"system.proof": ["terminal"]},
+        })
+        adapter = A2AAdapter(cfg)
+        calls = []
+
+        async def fake_handle_message(event):
+            calls.append(event.message_id)
+            await adapter.send(event.source.chat_id, "one execution", metadata={"notify": True})
+
+        adapter.handle_message = fake_handle_message  # type: ignore
+        adapter._message_handler = object()
+
+        def post(body, token, key_id):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/", data=json.dumps(body).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {token}",
+                    "X-A2A-Key-Id": key_id,
+                }, method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=5) as response:
+                return json.loads(response.read().decode())
+
+        async def run():
+            assert await adapter.connect() is True
+            message = protocol.text_message("user", "do it once")
+            message["contextId"] = "ctx-http-owned"
+            message["metadata"] = metadata
+            body = {"jsonrpc": "2.0", "id": "rpc-1", "method": "message/send",
+                    "params": {"message": message}}
+            first = await asyncio.to_thread(post, body, "token-a", "a-current")
+            task = first["result"]
+            task_id = task["id"]
+            duplicate = await asyncio.to_thread(post, body, "token-a", "a-current")
+            assert duplicate["result"]["id"] == task_id
+            assert calls == [task_id]
+
+            get_body = {"jsonrpc": "2.0", "id": "rpc-get", "method": "tasks/get",
+                        "params": {"taskId": task_id, "metadata": metadata}}
+            fetched = await asyncio.to_thread(post, get_body, "token-a", "a-current")
+            assert fetched["result"]["id"] == task_id
+
+            for forbidden in (
+                {"jsonrpc": "2.0", "id": "rpc-get-b", "method": "tasks/get",
+                 "params": {"taskId": task_id, "metadata": metadata}},
+                {"jsonrpc": "2.0", "id": "rpc-context-b", "method": "message/send",
+                 "params": {"message": {
+                     **protocol.text_message("user", "cross-principal context"),
+                     "contextId": "ctx-http-owned", "metadata": metadata,
+                 }}},
+            ):
+                with pytest.raises(urllib.error.HTTPError) as raised:
+                    await asyncio.to_thread(post, forbidden, "token-b", "b-current")
+                assert raised.value.code == 403
+
+            changed = json.loads(json.dumps(body))
+            changed["params"]["message"]["parts"][0]["text"] = "changed payload"
+            with pytest.raises(urllib.error.HTTPError) as conflict:
+                await asyncio.to_thread(post, changed, "token-a", "a-current")
+            assert conflict.value.code == 409
+            await adapter.disconnect()
+
+        asyncio.run(run())
+
+    def test_http_rejects_wrong_content_type_and_oversized_body(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
+        monkeypatch.delenv("A2A_HOST", raising=False)
+
+        import socket
+        from gateway.config import PlatformConfig
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        monkeypatch.setenv("A2A_PORT", str(port))
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={"max_request_bytes": 1024}))
+
+        def raw_post(data, content_type):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/", data=data,
+                headers={"Content-Type": content_type}, method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=5) as response:
+                return response.status
+
+        async def run():
+            assert await adapter.connect() is True
+            with pytest.raises(urllib.error.HTTPError) as wrong_type:
+                await asyncio.to_thread(raw_post, b"{}", "text/plain")
+            assert wrong_type.value.code == 415
+            with pytest.raises(urllib.error.HTTPError) as oversized:
+                await asyncio.to_thread(raw_post, b"x" * 1025, "application/json")
+            assert oversized.value.code == 413
+            assert adapter._httpd.max_inflight_requests if hasattr(adapter._httpd, "max_inflight_requests") else True
+            await adapter.disconnect()
+
+        asyncio.run(run())
 
 
 # --------------------------------------------------------------------------

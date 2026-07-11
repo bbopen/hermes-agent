@@ -49,7 +49,10 @@ def build_agent_card(
         "description": description,
         "url": url,
         "version": "0.1.0",
-        "protocolVersion": "0.3",
+        # The adapter implements the A2A v1.0 task/status subset it advertises:
+        # message/send, tasks/get, tasks/cancel, and durable terminal states.
+        # It intentionally does not claim streaming/push/history support.
+        "protocolVersion": "1.0",
         "capabilities": {
             "streaming": streaming,
             "pushNotifications": False,
