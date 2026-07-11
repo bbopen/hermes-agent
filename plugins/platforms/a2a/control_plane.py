@@ -785,7 +785,12 @@ class TaskStore:
             allow_uncertain=True,
         )
 
-    def reconcile_after_restart(self, *, exclude_owner: str = "") -> list[dict[str, Any]]:
+    def reconcile_after_restart(
+        self,
+        *,
+        exclude_owner: str = "",
+        protected_task_ids: frozenset[str] = frozenset(),
+    ) -> list[dict[str, Any]]:
         """Fence expired foreign executions without replaying or inventing success."""
         now = time.time()
         recovered: list[dict[str, Any]] = []
@@ -799,9 +804,10 @@ class TaskStore:
                               OR (lease_expires_at IS NULL
                                   AND execution_uncertain_at IS NULL))"""
             params: list[Any] = [protocol.STATE_WORKING, now, now]
-            if exclude_owner:
-                query += " AND lease_owner != ?"
-                params.append(exclude_owner)
+            if exclude_owner and protected_task_ids:
+                placeholders = ",".join("?" for _ in protected_task_ids)
+                query += f" AND NOT (lease_owner = ? AND task_id IN ({placeholders}))"
+                params.extend([exclude_owner, *sorted(protected_task_ids)])
             rows = conn.execute(query, params).fetchall()
             for row in rows:
                 task = dict(row)
@@ -947,7 +953,11 @@ class TaskStore:
         finally:
             conn.close()
 
-    def mark_audit_delivered(self, event_id: str, *, owner: str) -> bool:
+    def mark_audit_delivered(
+        self, event_id: str, *, owner: str, sink_event_id: str = ""
+    ) -> bool:
+        if not event_id or sink_event_id != event_id:
+            return False
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")

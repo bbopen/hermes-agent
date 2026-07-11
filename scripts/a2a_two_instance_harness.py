@@ -187,7 +187,7 @@ def _primary_main() -> int:
                         "ok": True,
                         "context_id": context_id,
                         "multi_turn": True,
-                        "final_reply_capture": True,
+                        "synchronous_task_result_capture": True,
                         "worker_local_side_effect": str(proof),
                         "separate_hermes_homes": True,
                     },

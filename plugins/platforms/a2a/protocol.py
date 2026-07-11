@@ -5,7 +5,7 @@ disk-backed conversation persistence.
 Wire shape follows the A2A spec (JSON-RPC 2.0 over HTTP):
   - Agent Card served at GET /.well-known/agent.json
   - Tasks via POST {jsonrpc:"2.0", method:"message/send", params:{...}}
-  - Methods handled inbound: message/send, tasks/get
+  - Methods handled inbound: message/send, tasks/get, tasks/cancel
 
 We deliberately implement the subset of A2A needed for text task exchange with
 stdlib only (no a2a-sdk). If a2a-sdk is later added as an optional extra, the
@@ -29,6 +29,9 @@ STATE_COMPLETED = "completed"
 STATE_FAILED = "failed"
 STATE_CANCELED = "canceled"
 
+PROTOCOL_VERSION = "0.3"
+SUPPORTED_METHODS = frozenset({"message/send", "tasks/get", "tasks/cancel"})
+
 
 # --------------------------------------------------------------------------
 # Agent Card
@@ -51,7 +54,7 @@ def build_agent_card(
         "version": "0.1.0",
         # Hermes implements a conservative interoperable subset; do not claim
         # A2A v1.0 conformance until every required v1 lifecycle surface exists.
-        "protocolVersion": "0.3",
+        "protocolVersion": PROTOCOL_VERSION,
         "capabilities": {
             "streaming": streaming,
             "pushNotifications": False,

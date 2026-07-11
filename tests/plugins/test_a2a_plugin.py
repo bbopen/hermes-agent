@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import Future
+import hashlib
 import json
+import multiprocessing
 import os
 import sqlite3
 import stat
@@ -30,6 +32,15 @@ from plugins.platforms.a2a.control_plane import (
     TaskStore,
     canonical_payload_sha256,
 )
+
+
+def _audit_process_writer(home: str, event_id: str, start) -> None:
+    os.environ["HERMES_HOME"] = home
+    start.wait(timeout=5)
+    if not security.audit(
+        "terminal", "peer", "task", "", status="completed", event_id=event_id,
+    ):
+        raise RuntimeError("audit write failed")
 
 
 # --------------------------------------------------------------------------
@@ -185,6 +196,18 @@ class TestBearerAuth:
         }]}}}
         assert security.configured_trusted_peers(extra) == []
 
+    @pytest.mark.parametrize("invalid", [["peer"], "peer", 7])
+    def test_non_mapping_trusted_peers_is_controlled_rejection(
+        self, monkeypatch, invalid,
+    ):
+        extra = {"trusted_peers": invalid}
+        assert security.configured_trusted_peers(extra) == []
+        assert security.authenticate_bearer("Bearer token", extra, "key") is None
+        monkeypatch.setenv("A2A_BEARER_TOKEN", "legacy-token")
+        assert security.authenticate_bearer(
+            "Bearer legacy-token", extra, local_request=True
+        ) is None
+
 
 class TestInjectionFilter:
     def test_chatml_defanged(self):
@@ -216,7 +239,15 @@ class TestOutboundRedaction:
     def test_openai_key_redacted(self):
         out = security.redact_outbound("my key is sk-abcdefghij1234567890XYZ")
         assert "sk-abcdefghij" not in out
-        assert "[redacted]" in out
+
+    def test_forced_shared_redactor_covers_new_tokens_and_private_keys(self):
+        secrets = (
+            "github_pat_11AA22bb33CC44dd55EE66ff77GG88hh ",
+            "AIza" + "A" * 35 + " ",
+            "-----BEGIN PRIVATE KEY-----\nabc123\n-----END PRIVATE KEY-----",
+        )
+        redacted = security.redact_outbound("".join(secrets))
+        assert all(secret.strip() not in redacted for secret in secrets)
 
     def test_github_token_redacted(self):
         out = security.redact_outbound("token ghp_0123456789abcdefghij0123")
@@ -263,6 +294,16 @@ class TestAudit:
         assert rec["request_id"] == "message-1"
         assert rec["status"] == "working"
 
+    def test_audit_hashes_redacted_boundary_text(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        secret = "AIza" + "A" * 35
+        assert security.audit("outbound", "peer", "task", secret)
+        record = json.loads(tmp_path.joinpath("a2a_audit.jsonl").read_text())
+        assert record["body_sha256"] == hashlib.sha256(
+            security.redact_outbound(secret).encode()
+        ).hexdigest()
+        assert record["body_sha256"] != hashlib.sha256(secret.encode()).hexdigest()
+
     def test_retry_with_same_outbox_event_id_is_sink_idempotent(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         for _ in range(2):
@@ -273,6 +314,90 @@ class TestAudit:
         records = tmp_path.joinpath("a2a_audit.jsonl").read_text().splitlines()
         assert len(records) == 1
         assert json.loads(records[0])["event_id"] == "task:terminal:completed"
+
+    def test_cross_process_duplicate_event_is_one_durable_record(
+        self, monkeypatch, tmp_path,
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        context = multiprocessing.get_context("spawn")
+        start = context.Barrier(3)
+        event_id = "task:terminal:cross-process"
+        processes = [
+            context.Process(
+                target=_audit_process_writer,
+                args=(str(tmp_path), event_id, start),
+            )
+            for _ in range(2)
+        ]
+        for process in processes:
+            process.start()
+        start.wait(timeout=5)
+        for process in processes:
+            process.join(timeout=10)
+            assert process.exitcode == 0
+        records = [
+            json.loads(line)
+            for line in tmp_path.joinpath("a2a_audit.jsonl").read_text().splitlines()
+        ]
+        assert [rec["event_id"] for rec in records] == [event_id]
+        assert security.audit_event_present(event_id) is True
+
+    def test_torn_tail_is_repaired_but_complete_corruption_fails_closed(
+        self, monkeypatch, tmp_path,
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        path = tmp_path / "a2a_audit.jsonl"
+        path.write_bytes(b'{"event_id":"valid"}\n{"event_id":')
+        assert security.audit(
+            "terminal", "peer", "task", "", event_id="after-repair",
+        ) is True
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        assert [record["event_id"] for record in records] == ["valid", "after-repair"]
+
+        path.write_bytes(b'{"event_id":}\n')
+        assert security.audit(
+            "terminal", "peer", "task", "", event_id="must-not-deliver",
+        ) is False
+        assert security.audit_event_present("must-not-deliver") is False
+
+    def test_claim_expiry_race_uses_one_sink_record_before_acknowledging(
+        self, monkeypatch, tmp_path,
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        store = TaskStore()
+        task, _ = TestDurableControlPlane._claim(
+            store, request="audit-claim-expiry",
+        )
+        first = store.claim_audit_events(
+            owner="flusher-a", task_id=task["task_id"], lease_seconds=1,
+        )[0]
+        assert security.audit(
+            first["direction"], first["principal"], first["task_id"], "",
+            event_id=first["event_id"],
+        )
+        conn = store._connect()
+        try:
+            conn.execute(
+                "UPDATE audit_outbox SET delivery_expires_at = ? WHERE event_id = ?",
+                (time.time() - 1, first["event_id"]),
+            )
+        finally:
+            conn.close()
+        second = TaskStore(store.path).claim_audit_events(
+            owner="flusher-b", task_id=task["task_id"], lease_seconds=30,
+        )[0]
+        assert security.audit(
+            second["direction"], second["principal"], second["task_id"], "",
+            event_id=second["event_id"],
+        )
+        assert store.mark_audit_delivered(
+            first["event_id"], owner="flusher-a", sink_event_id=first["event_id"],
+        ) is False
+        assert store.mark_audit_delivered(
+            second["event_id"], owner="flusher-b", sink_event_id=second["event_id"],
+        ) is True
+        records = tmp_path.joinpath("a2a_audit.jsonl").read_text().splitlines()
+        assert sum(json.loads(line)["event_id"] == first["event_id"] for line in records) == 1
 
 
 # --------------------------------------------------------------------------
@@ -572,8 +697,13 @@ class TestDurableControlPlane:
             owner="flusher-b", task_id=task["task_id"]
         )
         assert len(retry) == 1 and retry[0]["attempts"] == 2
+        assert security.audit(
+            retry[0]["direction"], retry[0]["principal"], task["task_id"], "",
+            event_id=retry[0]["event_id"],
+        )
         assert store.mark_audit_delivered(
-            retry[0]["event_id"], owner="flusher-b"
+            retry[0]["event_id"], owner="flusher-b",
+            sink_event_id=retry[0]["event_id"],
         ) is True
 
         terminal, emitted = store.terminalize(
@@ -586,8 +716,13 @@ class TestDurableControlPlane:
             owner="flusher-c", task_id=task["task_id"]
         )
         assert [event["direction"] for event in terminal_claim] == ["terminal"]
+        assert security.audit(
+            "terminal", terminal_claim[0]["principal"], task["task_id"], "",
+            event_id=terminal_claim[0]["event_id"],
+        )
         assert store.mark_audit_delivered(
-            terminal_claim[0]["event_id"], owner="flusher-c"
+            terminal_claim[0]["event_id"], owner="flusher-c",
+            sink_event_id=terminal_claim[0]["event_id"],
         ) is True
         assert terminal["state"] == protocol.STATE_COMPLETED
         assert store.terminal_delivery_state(task["task_id"]) == "delivered"
@@ -751,11 +886,17 @@ class TestClientTools:
             )
 
         monkeypatch.setattr(tools, "_http_post_json", fake_post)
-        out = tools.a2a_call({"agent": "r", "message": "my key sk-abcdefghij1234567890ABCD please"})
+        secrets = (
+            "github_pat_11AA22bb33CC44dd55EE66ff77GG88hh",
+            "AIza" + "A" * 35,
+            "-----BEGIN PRIVATE KEY-----\nabc123\n-----END PRIVATE KEY-----",
+        )
+        out = tools.a2a_call({"agent": "r", "message": " ".join(secrets)})
         assert "here is the answer" in out
         # Outbound redaction applied before sending.
         sent = captured["body"]["params"]["message"]["parts"][0]["text"]
-        assert "sk-abcdefghij" not in sent
+        assert all(secret not in sent for secret in secrets)
+        assert captured["body"]["jsonrpc"] == "2.0"
         assert captured["body"]["params"]["deadline"] > time.time()
 
     def test_call_reads_secret_from_key_env_and_sends_provenance(self, monkeypatch):
@@ -1114,6 +1255,22 @@ class TestTaskTerminalControls:
         assert result["status"]["state"] == protocol.STATE_FAILED
         assert "audit persistence unavailable" in protocol.extract_text(result["artifacts"][0])
 
+    def test_terminal_adapter_boundary_uses_forced_shared_redactor(
+        self, monkeypatch, tmp_path,
+    ):
+        adapter = self._adapter(monkeypatch, tmp_path)
+        task, _ = adapter._tasks.claim_request(
+            principal="localhost", on_behalf_of="", capability="",
+            request_key="redact-terminal",
+            payload_sha256=canonical_payload_sha256({"message": "redact"}),
+            requested_context_id="ctx-redact-terminal",
+            task_id=protocol.new_task_id(), deadline_at=None,
+            lease_owner=adapter._instance_id, lease_seconds=60,
+        )
+        secret = "github_pat_11AA22bb33CC44dd55EE66ff77GG88hh"
+        stored = adapter._finish_task(task, protocol.STATE_COMPLETED, secret)
+        assert secret not in stored["result_text"]
+
     def test_elapsed_deadline_is_terminal_before_dispatch(self, monkeypatch, tmp_path):
         adapter = self._adapter(monkeypatch, tmp_path)
         params = {
@@ -1123,6 +1280,40 @@ class TestTaskTerminalControls:
         result = adapter._handle_inbound_task(params, self._policy(), "rpc-deadline")
         assert result["status"]["state"] == protocol.STATE_FAILED
         assert "deadline elapsed" in protocol.extract_text(result["artifacts"][0])
+
+    def test_self_owned_expired_lease_requires_live_handler_heartbeat(
+        self, monkeypatch, tmp_path,
+    ):
+        adapter = self._adapter(monkeypatch, tmp_path)
+        task, _ = adapter._tasks.claim_request(
+            principal="localhost", on_behalf_of="", capability="",
+            request_key="self-owned-expired",
+            payload_sha256=canonical_payload_sha256({"message": "once"}),
+            requested_context_id="ctx-self-owned", task_id=protocol.new_task_id(),
+            deadline_at=None, lease_owner=adapter._instance_id, lease_seconds=60,
+        )
+        task, dispatched = adapter._tasks.mark_dispatched(
+            task["task_id"], owner=adapter._instance_id,
+            incarnation=task["incarnation"], lease_seconds=60,
+        )
+        assert dispatched is True
+        conn = adapter._tasks._connect()
+        try:
+            conn.execute(
+                "UPDATE tasks SET lease_expires_at = ? WHERE task_id = ?",
+                (time.time() - 1, task["task_id"]),
+            )
+        finally:
+            conn.close()
+
+        with adapter._pending_lock:
+            adapter._lease_heartbeats[task["task_id"]] = time.monotonic()
+        assert adapter._reconcile_durable_tasks() == []
+        with adapter._pending_lock:
+            adapter._lease_heartbeats[task["task_id"]] = time.monotonic() - 60
+        recovered = adapter._reconcile_durable_tasks()
+        assert [entry["task_id"] for entry in recovered] == [task["task_id"]]
+        assert recovered[0]["execution_uncertain_at"] is not None
 
     def test_cancel_intent_suppresses_late_terminal_reply(self, monkeypatch, tmp_path):
         adapter = self._adapter(monkeypatch, tmp_path)
@@ -1161,6 +1352,7 @@ class TestTaskTerminalControls:
 
     def test_terminal_audit_failure_remains_pending_and_retries(self, monkeypatch, tmp_path):
         adapter = self._adapter(monkeypatch, tmp_path)
+        real_audit = security.audit
         task, _ = adapter._tasks.claim_request(
             principal="localhost", on_behalf_of="", capability="", request_key="audit-retry",
             payload_sha256=canonical_payload_sha256({"message": "audit"}),
@@ -1174,6 +1366,9 @@ class TestTaskTerminalControls:
         assert adapter._flush_audit_outbox(task["task_id"]) is False
         assert adapter._tasks.pending_audit_events(task["task_id"])[0]["attempts"] == 1
         monkeypatch.setattr(security, "audit", lambda *args, **kwargs: True)
+        assert adapter._flush_audit_outbox(task["task_id"]) is False
+        assert adapter._tasks.pending_audit_events(task["task_id"])
+        monkeypatch.setattr(security, "audit", real_audit)
         assert adapter._flush_audit_outbox(task["task_id"]) is True
         delivered = adapter._tasks.claim_audit_events(
             owner="other", task_id=task["task_id"]
@@ -1382,20 +1577,61 @@ class TestPrincipalBoundTaskHTTP:
         adapter.handle_message = fake_handle_message  # type: ignore
         adapter._message_handler = object()
 
-        def post(body, token, key_id):
+        def post(body, token, key_id, version=protocol.PROTOCOL_VERSION):
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}",
+                "X-A2A-Key-Id": key_id,
+            }
+            if version is not None:
+                headers["A2A-Version"] = version
             req = urllib.request.Request(
                 f"http://127.0.0.1:{port}/", data=json.dumps(body).encode(),
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {token}",
-                    "X-A2A-Key-Id": key_id,
-                }, method="POST",
+                headers=headers, method="POST",
             )
             with urllib.request.urlopen(req, timeout=5) as response:
                 return json.loads(response.read().decode())
 
         async def run():
             assert await adapter.connect() is True
+            valid_params = {
+                "message": {
+                    **protocol.text_message("user", "must not execute"),
+                    "metadata": metadata,
+                }
+            }
+            for invalid_jsonrpc in (None, 2, "2.0 ", "1.0"):
+                invalid = {
+                    "jsonrpc": invalid_jsonrpc,
+                    "id": "invalid-jsonrpc",
+                    "method": "message/send",
+                    "params": valid_params,
+                }
+                with pytest.raises(urllib.error.HTTPError) as rejected:
+                    await asyncio.to_thread(
+                        post, invalid, "token-a", "a-current",
+                    )
+                assert rejected.value.code == 400
+            versioned = {
+                "jsonrpc": "2.0", "id": "invalid-version",
+                "method": "message/send", "params": valid_params,
+            }
+            for invalid_version in ("1.0", "0.3.0", "garbage"):
+                with pytest.raises(urllib.error.HTTPError) as rejected:
+                    await asyncio.to_thread(
+                        post, versioned, "token-a", "a-current", invalid_version,
+                    )
+                assert rejected.value.code == 400
+            unsupported = {
+                "jsonrpc": "2.0", "id": "unsupported-method",
+                "method": "tasks/resubscribe", "params": valid_params,
+            }
+            unsupported_result = await asyncio.to_thread(
+                post, unsupported, "token-a", "a-current",
+            )
+            assert unsupported_result["error"]["code"] == -32601
+            assert calls == []
+
             message = protocol.text_message("user", "do it once")
             message["contextId"] = "ctx-http-owned"
             message["metadata"] = metadata

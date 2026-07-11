@@ -442,7 +442,10 @@ def a2a_call(args: dict, **_: Any) -> str:
         )
     except ValueError as e:
         return f"Error: unsafe peer URL — {e}."
-    headers = _auth_header(peer["auth"])
+    headers = {
+        "A2A-Version": protocol.PROTOCOL_VERSION,
+        **_auth_header(peer["auth"]),
+    }
     try:
         timeout = float(peer["timeout"])
     except (TypeError, ValueError):
@@ -506,6 +509,11 @@ def a2a_call(args: dict, **_: Any) -> str:
         )
     except ValueError as e:
         return f"Error: peer '{agent}' Agent Card was rejected — {e}."
+    if card is not None and card.get("protocolVersion") != protocol.PROTOCOL_VERSION:
+        return (
+            f"Error: peer '{agent}' advertises unsupported A2A protocol version "
+            f"{card.get('protocolVersion')!r}."
+        )
 
     try:
         peer_remaining = _remaining(request_deadline)

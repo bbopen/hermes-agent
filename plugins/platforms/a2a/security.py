@@ -18,6 +18,7 @@ Layers (all opt-out-able only by explicit config, never silently):
 from __future__ import annotations
 
 import hmac
+import fcntl
 import ipaddress
 import json
 import logging
@@ -165,7 +166,8 @@ def configured_trusted_peers(
     over_limit_principals: set[str] = set()
     peers = extra.get("trusted_peers") or {}
     if not isinstance(peers, Mapping):
-        return result
+        logger.error("A2A: trusted_peers must be a mapping; rejecting configuration")
+        return []
     for principal, raw in peers.items():
         if not isinstance(raw, Mapping) or raw.get("enabled", True) is False:
             continue
@@ -225,8 +227,13 @@ def configured_trusted_peers(
 
 
 def _has_trusted_peer_config(extra: Mapping[str, Any]) -> bool:
-    peers = extra.get("trusted_peers") or {}
-    return isinstance(peers, Mapping) and bool(peers)
+    peers = extra.get("trusted_peers")
+    if peers is None:
+        return False
+    # Invalid non-mapping configuration is still configuration: keep the
+    # request on the named-peer path so it fails closed instead of silently
+    # falling back to legacy localhost bearer behavior.
+    return not isinstance(peers, Mapping) or bool(peers)
 
 
 def authenticate_bearer(
@@ -398,27 +405,22 @@ def wrap_inbound(peer: str, text: str, *, on_behalf_of: str = "", capability: st
 # Outbound redaction
 # --------------------------------------------------------------------------
 
-# Credential-shaped strings we never want to ship to a peer in a task body.
-_REDACTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"sk-[A-Za-z0-9_\-]{16,}"), "sk-[redacted]"),
-    (re.compile(r"sk-ant-[A-Za-z0-9_\-]{16,}"), "sk-ant-[redacted]"),
-    (re.compile(r"ghp_[A-Za-z0-9]{20,}"), "ghp_[redacted]"),
-    (re.compile(r"xox[bap]-[A-Za-z0-9\-]{10,}"), "xox-[redacted]"),
-    (re.compile(r"AKIA[0-9A-Z]{16}"), "AKIA[redacted]"),
-    (re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"), "[redacted-jwt]"),
-    (re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]{20,}"), "Bearer [redacted]"),
-    (re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"), "[redacted-email]"),
-)
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 
 
 def redact_outbound(text: str) -> str:
     """Scrub credential-shaped substrings before sending text to a peer."""
     if not text:
         return text
-    out = text
-    for pat, repl in _REDACTION_PATTERNS:
-        out = pat.sub(repl, out)
-    return out
+    # A2A is a mandatory disclosure boundary: user-level log redaction opt-out
+    # must never permit credentials to cross it. Reuse the maintained core
+    # corpus so new vendor formats are covered here automatically.
+    from agent.redact import redact_sensitive_text
+
+    return _EMAIL_RE.sub(
+        "[redacted-email]",
+        redact_sensitive_text(text, force=True),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -435,6 +437,61 @@ def _audit_path() -> Path:
 
 
 _AUDIT_LOCK = threading.Lock()
+
+
+def _locked_audit_records(fd: int) -> list[dict[str, Any]]:
+    """Read a locked JSONL sink, repairing only an incomplete final record."""
+    os.lseek(fd, 0, os.SEEK_SET)
+    raw = b""
+    while True:
+        chunk = os.read(fd, 1024 * 1024)
+        if not chunk:
+            break
+        raw += chunk
+    records: list[dict[str, Any]] = []
+    offset = 0
+    lines = raw.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        complete = line.endswith(b"\n")
+        try:
+            parsed = json.loads(line.decode("utf-8"))
+            if not isinstance(parsed, dict):
+                raise ValueError("audit record is not an object")
+        except (UnicodeError, json.JSONDecodeError, ValueError):
+            if index == len(lines) - 1 and not complete:
+                os.ftruncate(fd, offset)
+                os.fsync(fd)
+                return records
+            raise OSError("audit sink contains a malformed record")
+        if not complete:
+            # A parseable but unterminated tail is made durable before it can
+            # serve as unique delivery evidence.
+            os.lseek(fd, 0, os.SEEK_END)
+            os.write(fd, b"\n")
+            os.fsync(fd)
+        records.append(parsed)
+        offset += len(line)
+    return records
+
+
+def audit_event_present(event_id: str) -> bool:
+    """Return whether a parseable, durable unique sink record exists."""
+    if not event_id:
+        return False
+    path = _audit_path()
+    try:
+        with _AUDIT_LOCK:
+            fd = os.open(path, os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                records = _locked_audit_records(fd)
+                return sum(rec.get("event_id") == event_id for rec in records) == 1
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+    except Exception:
+        logger.debug("A2A: audit evidence check failed", exc_info=True)
+        return False
 
 
 def audit(
@@ -458,10 +515,10 @@ def audit(
         rec = {
             "ts": time.time(),
             "direction": direction,  # "inbound" | "outbound"
-            "peer": peer,
-            "principal": peer,
-            "on_behalf_of": on_behalf_of,
-            "capability": capability,
+            "peer": redact_outbound(peer),
+            "principal": redact_outbound(peer),
+            "on_behalf_of": redact_outbound(on_behalf_of),
+            "capability": redact_outbound(capability),
             "task_id": task_id,
             "request_id": request_id,
             "status": status,
@@ -469,7 +526,9 @@ def audit(
             # Prompt and reply bodies are intentionally never audit records.
             # A hash permits correlation without creating a second sensitive
             # data store alongside the Hermes conversation state.
-            "body_sha256": hashlib.sha256((summary or "").encode("utf-8")).hexdigest(),
+            "body_sha256": hashlib.sha256(
+                redact_outbound(summary or "").encode("utf-8")
+            ).hexdigest(),
         }
         path = _audit_path()
         payload = (json.dumps(rec, ensure_ascii=False) + "\n").encode("utf-8")
@@ -479,25 +538,14 @@ def audit(
                 os.chmod(path.parent, 0o700)
             except OSError:
                 pass
-            if event_id and path.exists():
-                # The SQLite outbox and JSONL append cannot share one atomic
-                # transaction. A stable event id closes the crash window: if
-                # append succeeded but the delivered mark did not, retry sees
-                # the existing sink record and acknowledges it without a
-                # duplicate terminal notification.
-                try:
-                    with path.open("r", encoding="utf-8") as existing:
-                        for line in existing:
-                            try:
-                                if json.loads(line).get("event_id") == event_id:
-                                    return True
-                            except (json.JSONDecodeError, AttributeError):
-                                continue
-                except (OSError, UnicodeError):
-                    pass
-            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
             try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
                 os.fchmod(fd, 0o600)
+                records = _locked_audit_records(fd)
+                if event_id and any(rec.get("event_id") == event_id for rec in records):
+                    return True
+                os.lseek(fd, 0, os.SEEK_END)
                 written = 0
                 while written < len(payload):
                     count = os.write(fd, payload[written:])
@@ -506,6 +554,7 @@ def audit(
                     written += count
                 os.fsync(fd)
             finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
                 os.close(fd)
         return True
     except Exception:

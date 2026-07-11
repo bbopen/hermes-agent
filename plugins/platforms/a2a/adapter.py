@@ -240,6 +240,7 @@ class A2AAdapter(BasePlatformAdapter):
         self._active_tasks: Dict[str, str] = {}
         self._active_session_keys: Dict[str, str] = {}
         self._dispatch_futures: Dict[str, Future] = {}
+        self._lease_heartbeats: Dict[str, float] = {}
         self._pending_lock = threading.Lock()
 
     @contextmanager
@@ -268,6 +269,21 @@ class A2AAdapter(BasePlatformAdapter):
     def name(self) -> str:
         return "A2A"
 
+    def _reconcile_durable_tasks(self) -> list[dict[str, Any]]:
+        """Reap stale own leases while protecting handlers with a live heartbeat."""
+        now = time.monotonic()
+        heartbeat_window = max(1.0, min(10.0, self.lease_seconds * 0.75))
+        with self._pending_lock:
+            protected = frozenset(
+                task_id
+                for task_id, heartbeat_at in self._lease_heartbeats.items()
+                if now - heartbeat_at <= heartbeat_window
+            )
+        return self._tasks.reconcile_after_restart(
+            exclude_owner=self._instance_id,
+            protected_task_ids=protected,
+        )
+
     def _flush_audit_outbox(self, task_id: Optional[str] = None) -> bool:
         """Claim and retry durable audit delivery without concurrent duplication."""
         delivered_all = True
@@ -292,9 +308,11 @@ class A2AAdapter(BasePlatformAdapter):
                     status=event["status"],
                     event_id=event["event_id"],
                 )
-                if ok:
+                if ok and security.audit_event_present(event["event_id"]):
                     if not self._tasks.mark_audit_delivered(
-                        event["event_id"], owner=self._instance_id
+                        event["event_id"],
+                        owner=self._instance_id,
+                        sink_event_id=event["event_id"],
                     ):
                         delivered_all = False
                 else:
@@ -325,7 +343,7 @@ class A2AAdapter(BasePlatformAdapter):
             try:
                 await asyncio.sleep(self.maintenance_interval)
                 with self._profile_runtime_scope():
-                    self._tasks.reconcile_after_restart(exclude_owner=self._instance_id)
+                    self._reconcile_durable_tasks()
                     self._flush_audit_outbox()
             except asyncio.CancelledError:
                 return
@@ -350,7 +368,7 @@ class A2AAdapter(BasePlatformAdapter):
         # visible terminal result rather than dispatching it again.
         try:
             with self._profile_runtime_scope():
-                self._tasks.reconcile_after_restart(exclude_owner=self._instance_id)
+                self._reconcile_durable_tasks()
                 self._flush_audit_outbox()
         except Exception:
             logger.error("A2A: durable task reconciliation failed", exc_info=True)
@@ -447,8 +465,33 @@ class A2AAdapter(BasePlatformAdapter):
                 req_id = req.get("id")
                 method = req.get("method", "")
                 params = req.get("params", {}) or {}
+                requested_versions = self.headers.get_all("A2A-Version", failobj=[])
+                if req.get("jsonrpc") != "2.0":
+                    self._json(400, protocol.jsonrpc_error(
+                        req_id, -32600, "jsonrpc must be exactly '2.0'",
+                    ))
+                    return
+                if (
+                    requested_versions
+                    and (
+                        len(requested_versions) != 1
+                        or requested_versions[0] != protocol.PROTOCOL_VERSION
+                    )
+                ):
+                    self._json(400, protocol.jsonrpc_error(
+                        req_id,
+                        -32600,
+                        "unsupported A2A-Version; supported version is "
+                        f"{protocol.PROTOCOL_VERSION}",
+                    ))
+                    return
                 if not isinstance(method, str) or not isinstance(params, dict):
                     self._json(400, protocol.jsonrpc_error(req_id, -32600, "invalid JSON-RPC request"))
+                    return
+                if method not in protocol.SUPPORTED_METHODS:
+                    self._json(200, protocol.jsonrpc_error(
+                        req_id, -32601, f"method not found: {method}",
+                    ))
                     return
 
                 if method == "message/send":
@@ -492,9 +535,7 @@ class A2AAdapter(BasePlatformAdapter):
                         self._json(400, protocol.jsonrpc_error(req_id, -32602, "valid task id is required"))
                         return
                     try:
-                        adapter._tasks.reconcile_after_restart(
-                            exclude_owner=adapter._instance_id
-                        )
+                        adapter._reconcile_durable_tasks()
                         task = adapter._tasks.get_task(
                             task_id,
                             principal=policy.principal,
@@ -605,6 +646,7 @@ class A2AAdapter(BasePlatformAdapter):
             self._active_tasks.clear()
             self._active_session_keys.clear()
             self._dispatch_futures.clear()
+            self._lease_heartbeats.clear()
 
     # ── Agent Card ────────────────────────────────────────────────────────
 
@@ -901,7 +943,7 @@ class A2AAdapter(BasePlatformAdapter):
             "effectiveContextId": requested_context_id,
             "effectiveDeadline": deadline_at,
         }
-        self._tasks.reconcile_after_restart(exclude_owner=self._instance_id)
+        self._reconcile_durable_tasks()
         task, created = self._tasks.claim_request(
             principal=policy.principal,
             on_behalf_of=policy.on_behalf_of,
@@ -915,7 +957,7 @@ class A2AAdapter(BasePlatformAdapter):
             lease_seconds=self.lease_seconds,
         )
         if not created:
-            self._tasks.reconcile_after_restart(exclude_owner=self._instance_id)
+            self._reconcile_durable_tasks()
             self._flush_audit_outbox(task["task_id"])
             return task_to_wire(
                 self._wait_for_task(task["task_id"], self.reply_timeout)
@@ -966,6 +1008,7 @@ class A2AAdapter(BasePlatformAdapter):
             self._pending_replies[context_id] = fut
             self._pending_tasks[context_id] = task_id
             self._active_tasks[task_id] = context_id
+            self._lease_heartbeats[task_id] = time.monotonic()
 
         event = MessageEvent(
             text=framed,
@@ -1004,6 +1047,7 @@ class A2AAdapter(BasePlatformAdapter):
                 self._pending_tasks.pop(context_id, None)
                 self._active_tasks.pop(task_id, None)
                 self._active_session_keys.pop(task_id, None)
+                self._lease_heartbeats.pop(task_id, None)
             deactivate(context_id)
             if task.get("cancel_requested_at") is not None and task.get("dispatched_at") is None:
                 task, _ = self._tasks.terminalize_if_not_dispatched(
@@ -1036,6 +1080,7 @@ class A2AAdapter(BasePlatformAdapter):
                 self._active_tasks.pop(task_id, None)
                 self._active_session_keys.pop(task_id, None)
                 self._dispatch_futures.pop(task_id, None)
+                self._lease_heartbeats.pop(task_id, None)
             deactivate(context_id)
             return task_to_wire(self._finish_task(
                 task, protocol.STATE_FAILED, f"Dispatch failed: {e}"
@@ -1084,6 +1129,8 @@ class A2AAdapter(BasePlatformAdapter):
                         lease_seconds=self.lease_seconds,
                     ):
                         raise _LeaseLost("execution lease could not be renewed")
+                    with self._pending_lock:
+                        self._lease_heartbeats[task_id] = time.monotonic()
         except _AgentShuttingDown:
             self._tasks.request_stop(
                 task_id,
@@ -1137,6 +1184,7 @@ class A2AAdapter(BasePlatformAdapter):
                 self._active_tasks.pop(task_id, None)
                 self._active_session_keys.pop(task_id, None)
                 self._dispatch_futures.pop(task_id, None)
+                self._lease_heartbeats.pop(task_id, None)
             deactivate(context_id)
 
         final_task = self._tasks.get_task(task_id, enforce_capability=False)
