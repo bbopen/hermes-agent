@@ -11,7 +11,9 @@ Peers are resolved from config.yaml under ``a2a_agents``::
     a2a_agents:
       researcher:
         url: "http://localhost:9999"
-        auth: { type: bearer, token: "sk-..." }
+        auth: { type: bearer, key_env: "RESEARCHER_A2A_TOKEN" }
+        on_behalf_of: "brett"
+        capability: "research.read"
         timeout: 120
 
 Transport is stdlib urllib (no a2a-sdk dependency). The wire format is the A2A
@@ -59,12 +61,20 @@ def _resolve_peer(agent: str) -> Optional[dict]:
         "url": entry.get("url", ""),
         "auth": entry.get("auth", {}) or {},
         "timeout": int(entry.get("timeout", _DEFAULT_TIMEOUT)),
+        "on_behalf_of": str(entry.get("on_behalf_of") or ""),
+        "capability": str(entry.get("capability") or ""),
     }
 
 
 def _auth_header(auth: dict) -> dict:
-    if auth and auth.get("type") == "bearer" and auth.get("token"):
-        return {"Authorization": f"Bearer {auth['token']}"}
+    if auth and auth.get("type") == "bearer":
+        key_env = str(auth.get("key_env") or "").strip()
+        token = os.getenv(key_env, "").strip() if key_env else ""
+        # Legacy plaintext config remains readable for compatibility, but new
+        # configurations must use key_env so secrets stay in the profile .env.
+        token = token or str(auth.get("token") or "").strip()
+        if token:
+            return {"Authorization": f"Bearer {token}"}
     return {}
 
 
@@ -140,6 +150,8 @@ def a2a_call(args: dict, **_: Any) -> str:
     agent = str(args.get("agent") or args.get("agent_name") or args.get("name") or "").strip()
     message = str(args.get("message") or args.get("text") or args.get("task") or "").strip()
     context_id = str(args.get("context_id") or args.get("contextId") or "").strip()
+    on_behalf_of = str(args.get("on_behalf_of") or "").strip()
+    capability = str(args.get("capability") or "").strip()
     if not agent or not message:
         return "Error: both 'agent' and 'message' are required."
 
@@ -153,6 +165,8 @@ def a2a_call(args: dict, **_: Any) -> str:
     base_url = peer["url"]
     headers = _auth_header(peer["auth"])
     timeout = peer["timeout"]
+    on_behalf_of = on_behalf_of or peer.get("on_behalf_of", "")
+    capability = capability or peer.get("capability", "")
 
     # Best-effort card fetch (to learn the rpc URL); non-fatal on failure.
     card = None
@@ -168,6 +182,10 @@ def a2a_call(args: dict, **_: Any) -> str:
         "id": protocol.new_task_id(),
         "method": "message/send",
         "params": {"message": protocol.text_message("user", safe_message)},
+    }
+    rpc_body["params"]["message"]["metadata"] = {
+        "on_behalf_of": on_behalf_of,
+        "capability": capability,
     }
     if context_id:
         rpc_body["params"]["message"]["contextId"] = context_id
@@ -280,6 +298,8 @@ _SCHEMAS = {
                     "agent": {"type": "string", "description": "Configured peer name (from a2a_agents) or a full http(s):// URL."},
                     "message": {"type": "string", "description": "The task / message to send the peer, in natural language."},
                     "context_id": {"type": "string", "description": "Optional: context id from a prior reply, to continue the conversation."},
+                    "on_behalf_of": {"type": "string", "description": "User identity represented by this delegation; normally configured on the peer."},
+                    "capability": {"type": "string", "description": "Requested capability grant; normally configured on the peer."},
                 },
                 "required": ["agent", "message"],
             },

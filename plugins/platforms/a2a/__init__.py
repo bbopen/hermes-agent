@@ -91,6 +91,8 @@ def register(ctx) -> None:
     try:
         from .tools import register_tools
         register_tools(ctx)
+        from .runtime_policy import enforce_tool_scope
+        ctx.register_hook("pre_tool_call", enforce_tool_scope)
     except Exception:
         logger.warning("A2A: failed to register client tools", exc_info=True)
 

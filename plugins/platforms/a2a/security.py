@@ -23,8 +23,9 @@ import logging
 import os
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -58,26 +59,116 @@ def check_bearer(auth_header: Optional[str]) -> bool:
     return hmac.compare_digest(parts[1].strip(), token)
 
 
-def localhost_only() -> bool:
+@dataclass(frozen=True)
+class PeerIdentity:
+    """Identity and grants derived from a successfully matched secret."""
+
+    principal: str
+    on_behalf_of: frozenset[str]
+    capabilities: frozenset[str]
+    legacy: bool = False
+
+
+def _presented_bearer(auth_header: Optional[str]) -> str:
+    if not auth_header:
+        return ""
+    parts = auth_header.split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return ""
+    return parts[1].strip()
+
+
+def configured_trusted_peers(extra: Mapping[str, Any]) -> list[tuple[PeerIdentity, str]]:
+    """Load non-secret peer policy and resolve each secret via ``token_env``."""
+    result: list[tuple[PeerIdentity, str]] = []
+    peers = extra.get("trusted_peers") or {}
+    if not isinstance(peers, Mapping):
+        return result
+    for principal, raw in peers.items():
+        if not isinstance(raw, Mapping) or raw.get("enabled", True) is False:
+            continue
+        token_env = str(raw.get("token_env") or "").strip()
+        token = os.getenv(token_env, "").strip() if token_env else ""
+        if not token:
+            logger.warning("A2A: trusted peer %r has no usable token_env", principal)
+            continue
+        obo = frozenset(str(v) for v in (raw.get("on_behalf_of") or []))
+        caps = frozenset(str(v) for v in (raw.get("capabilities") or []))
+        result.append((PeerIdentity(str(principal), obo, caps), token))
+    return result
+
+
+def authenticate_bearer(
+    auth_header: Optional[str], extra: Mapping[str, Any]
+) -> Optional[PeerIdentity]:
+    """Return the identity bound to the presented bearer secret.
+
+    Caller-supplied JSON fields never participate in identity selection.
+    """
+    configured = configured_trusted_peers(extra)
+    presented = _presented_bearer(auth_header)
+    if configured:
+        if not presented:
+            return None
+        for identity, expected in configured:
+            if hmac.compare_digest(presented, expected):
+                return identity
+        return None
+
+    # Backwards-compatible single-token and localhost modes.  They remain
+    # useful for tests and local development but do not provide provenance.
+    if not get_bearer_token():
+        return PeerIdentity("localhost", frozenset({"*"}), frozenset({"*"}), True)
+    if check_bearer(auth_header):
+        return PeerIdentity("legacy-bearer", frozenset({"*"}), frozenset({"*"}), True)
+    return None
+
+
+def authorize_claims(
+    identity: PeerIdentity, on_behalf_of: str, capability: str
+) -> Optional[str]:
+    """Return an operator-safe denial reason, or ``None`` when authorized."""
+    if identity.legacy:
+        return None
+    if not on_behalf_of:
+        return "on_behalf_of is required"
+    if not capability:
+        return "capability is required"
+    if "*" not in identity.on_behalf_of and on_behalf_of not in identity.on_behalf_of:
+        return "on_behalf_of is not authorized for this peer"
+    if "*" not in identity.capabilities and capability not in identity.capabilities:
+        return "capability is not authorized for this peer"
+    return None
+
+
+def has_inbound_credentials(extra: Optional[Mapping[str, Any]] = None) -> bool:
+    """True when either trusted-peer or legacy bearer auth is configured."""
+    if extra and configured_trusted_peers(extra):
+        return True
+    return bool(get_bearer_token())
+
+
+def localhost_only(extra: Optional[Mapping[str, Any]] = None) -> bool:
     """True when we must refuse non-loopback binds (no bearer token set)."""
-    return not get_bearer_token()
+    return not has_inbound_credentials(extra)
 
 
-def resolve_bind_host() -> str:
+def resolve_bind_host(extra: Optional[Mapping[str, Any]] = None) -> str:
     """Resolve the safe inbound bind host.
 
     Rule: localhost unless the operator BOTH set a bearer token AND explicitly
     asked for a wider host. A token alone does not widen the bind — opting into
     remote exposure must be deliberate.
     """
-    requested = os.getenv("A2A_HOST", "").strip() or "127.0.0.1"
+    requested = str((extra or {}).get("host") or os.getenv("A2A_HOST", "")).strip()
+    requested = requested or "127.0.0.1"
     loopback = {"127.0.0.1", "localhost", "::1"}
     if requested in loopback:
         return requested
-    if localhost_only():
+    if localhost_only(extra):
         logger.warning(
             "A2A: A2A_HOST=%s ignored — no A2A_BEARER_TOKEN set; binding to "
-            "127.0.0.1. Set a bearer token to expose A2A remotely.",
+            "127.0.0.1. Configure a trusted peer token to expose A2A remotely.",
             requested,
         )
         return "127.0.0.1"
@@ -125,9 +216,15 @@ PRIVACY_PREFIX = (
 )
 
 
-def wrap_inbound(peer: str, text: str) -> str:
+def wrap_inbound(peer: str, text: str, *, on_behalf_of: str = "", capability: str = "") -> str:
     """Filter + frame inbound task text for safe injection into the agent."""
-    return PRIVACY_PREFIX.format(peer=peer or "unknown") + filter_inbound(text)
+    provenance = ""
+    if on_behalf_of or capability:
+        provenance = (
+            f"Authenticated delegation: on_behalf_of={on_behalf_of!r}; "
+            f"capability={capability!r}. Tool access is enforced separately.\n\n"
+        )
+    return PRIVACY_PREFIX.format(peer=peer or "unknown") + provenance + filter_inbound(text)
 
 
 # --------------------------------------------------------------------------
@@ -170,13 +267,23 @@ def _audit_path() -> Path:
     return base / "a2a_audit.jsonl"
 
 
-def audit(direction: str, peer: str, task_id: str, summary: str) -> None:
+def audit(
+    direction: str,
+    peer: str,
+    task_id: str,
+    summary: str,
+    *,
+    on_behalf_of: str = "",
+    capability: str = "",
+) -> None:
     """Append an audit record. Best-effort — never raises into the caller."""
     try:
         rec = {
             "ts": time.time(),
             "direction": direction,  # "inbound" | "outbound"
             "peer": peer,
+            "on_behalf_of": on_behalf_of,
+            "capability": capability,
             "task_id": task_id,
             "summary": (summary or "")[:500],
         }

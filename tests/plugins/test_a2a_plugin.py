@@ -17,7 +17,7 @@ import urllib.request
 
 import pytest
 
-from plugins.platforms.a2a import protocol, security, tools
+from plugins.platforms.a2a import protocol, runtime_policy, security, tools
 
 
 # --------------------------------------------------------------------------
@@ -47,6 +47,20 @@ class TestBindSafety:
         monkeypatch.setenv("A2A_HOST", "localhost")
         assert security.resolve_bind_host() == "localhost"
 
+    def test_trusted_peer_credentials_allow_explicit_remote_bind(self, monkeypatch):
+        monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
+        monkeypatch.setenv("SPARK_A2A_TOKEN", "peer-secret")
+        extra = {
+            "host": "100.89.114.61",
+            "trusted_peers": {"spark-primary": {
+                "token_env": "SPARK_A2A_TOKEN",
+                "on_behalf_of": ["brett"],
+                "capabilities": ["system.proof"],
+            }},
+        }
+        assert security.localhost_only(extra) is False
+        assert security.resolve_bind_host(extra) == "100.89.114.61"
+
 
 class TestBearerAuth:
     def test_no_token_accepts_anything(self, monkeypatch):
@@ -63,6 +77,31 @@ class TestBearerAuth:
         assert security.check_bearer("Bearer nope") is False
         assert security.check_bearer(None) is False
         assert security.check_bearer("Basic abc123") is False
+
+    def test_trusted_token_derives_identity_and_grants(self, monkeypatch):
+        monkeypatch.setenv("SPARK_A2A_TOKEN", "peer-secret")
+        extra = {"trusted_peers": {"spark-primary": {
+            "token_env": "SPARK_A2A_TOKEN",
+            "on_behalf_of": ["brett"],
+            "capabilities": ["brain.read"],
+        }}}
+        identity = security.authenticate_bearer("Bearer peer-secret", extra)
+        assert identity is not None
+        assert identity.principal == "spark-primary"
+        assert security.authorize_claims(identity, "brett", "brain.read") is None
+
+    def test_caller_cannot_claim_ungranted_obo_or_capability(self, monkeypatch):
+        monkeypatch.setenv("SPARK_A2A_TOKEN", "peer-secret")
+        extra = {"trusted_peers": {"spark-primary": {
+            "token_env": "SPARK_A2A_TOKEN",
+            "on_behalf_of": ["brett"],
+            "capabilities": ["brain.read"],
+        }}}
+        identity = security.authenticate_bearer("Bearer peer-secret", extra)
+        assert identity is not None
+        assert security.authorize_claims(identity, "mallory", "brain.read")
+        assert security.authorize_claims(identity, "brett", "mail.send")
+        assert security.authenticate_bearer("Bearer wrong", extra) is None
 
 
 class TestInjectionFilter:
@@ -252,6 +291,32 @@ class TestClientTools:
         sent = captured["body"]["params"]["message"]["parts"][0]["text"]
         assert "sk-abcdefghij" not in sent
 
+    def test_call_reads_secret_from_key_env_and_sends_provenance(self, monkeypatch):
+        monkeypatch.setenv("WORKER_A2A_TOKEN", "dedicated-secret")
+        monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {
+            "worker": {
+                "url": "http://hms-m1:9900",
+                "auth": {"type": "bearer", "key_env": "WORKER_A2A_TOKEN"},
+                "on_behalf_of": "brett",
+                "capability": "system.proof",
+            }
+        }})
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
+        captured = {}
+
+        def fake_post(url, body, headers, timeout):
+            captured.update(headers=headers, body=body)
+            return protocol.jsonrpc_result(
+                body["id"],
+                protocol.build_task("t", "c", protocol.STATE_COMPLETED, "ok"),
+            )
+
+        monkeypatch.setattr(tools, "_http_post_json", fake_post)
+        assert "ok" in tools.a2a_call({"agent": "worker", "message": "prove it"})
+        assert captured["headers"]["Authorization"] == "Bearer dedicated-secret"
+        metadata = captured["body"]["params"]["message"]["metadata"]
+        assert metadata == {"on_behalf_of": "brett", "capability": "system.proof"}
+
     def test_list_no_peers(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setattr(tools, "_load_config", lambda: {})
@@ -348,6 +413,113 @@ class TestReplyCapture:
         finally:
             with adapter._pending_lock:
                 adapter._pending_replies.pop("ctx-final", None)
+
+    def test_disconnect_fails_pending_reply(self):
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = A2AAdapter(PlatformConfig(enabled=True))
+        fut = Future()
+        with adapter._pending_lock:
+            adapter._pending_replies["ctx-stop"] = fut
+        asyncio.run(adapter.disconnect())
+        assert fut.done() is True
+        assert isinstance(fut.exception(), RuntimeError)
+
+
+class TestCapabilityEnforcement:
+    def test_non_a2a_sessions_are_untouched(self, monkeypatch):
+        monkeypatch.setattr(
+            "gateway.session_context.get_session_env",
+            lambda name, default="": "matrix" if name == "HERMES_SESSION_PLATFORM" else default,
+        )
+        assert runtime_policy.enforce_tool_scope("terminal") is None
+
+    def test_a2a_tools_are_exactly_allowlisted(self, monkeypatch):
+        values = {
+            "HERMES_SESSION_PLATFORM": "a2a",
+            "HERMES_SESSION_CHAT_ID": "ctx-scope",
+        }
+        monkeypatch.setattr(
+            "gateway.session_context.get_session_env",
+            lambda name, default="": values.get(name, default),
+        )
+        policy = runtime_policy.ActivePolicy(
+            principal="spark-primary",
+            on_behalf_of="brett",
+            capability="system.proof",
+            allowed_tools=frozenset({"terminal"}),
+        )
+        assert runtime_policy.activate("ctx-scope", policy)
+        try:
+            assert runtime_policy.enforce_tool_scope("terminal") is None
+            blocked = runtime_policy.enforce_tool_scope("browser_navigate")
+            assert blocked["action"] == "block"
+            assert "system.proof" in blocked["message"]
+        finally:
+            runtime_policy.deactivate("ctx-scope")
+
+    def test_missing_a2a_policy_fails_closed(self, monkeypatch):
+        values = {
+            "HERMES_SESSION_PLATFORM": "a2a",
+            "HERMES_SESSION_CHAT_ID": "ctx-missing",
+        }
+        monkeypatch.setattr(
+            "gateway.session_context.get_session_env",
+            lambda name, default="": values.get(name, default),
+        )
+        assert runtime_policy.enforce_tool_scope("terminal")["action"] == "block"
+
+
+class TestRequestPolicy:
+    def test_authenticated_identity_replaces_caller_peer(self, monkeypatch):
+        monkeypatch.setenv("SPARK_A2A_TOKEN", "secret")
+        from gateway.config import PlatformConfig
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        cfg = PlatformConfig(enabled=True, extra={
+            "trusted_peers": {"spark-primary": {
+                "token_env": "SPARK_A2A_TOKEN",
+                "on_behalf_of": ["brett"],
+                "capabilities": ["system.proof"],
+            }},
+            "capability_tools": {"system.proof": ["terminal"]},
+        })
+        adapter = A2AAdapter(cfg)
+        identity = security.authenticate_bearer("Bearer secret", adapter.extra)
+        params = {
+            "peer": "attacker-chosen-name",
+            "message": {
+                **protocol.text_message("user", "hello"),
+                "metadata": {"on_behalf_of": "brett", "capability": "system.proof"},
+            },
+        }
+        policy, denial = adapter._request_policy(params, identity)
+        assert denial is None
+        assert policy.principal == "spark-primary"
+        assert policy.allowed_tools == frozenset({"terminal"})
+
+    def test_missing_tool_grant_is_denied(self, monkeypatch):
+        monkeypatch.setenv("SPARK_A2A_TOKEN", "secret")
+        from gateway.config import PlatformConfig
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        cfg = PlatformConfig(enabled=True, extra={"trusted_peers": {
+            "spark-primary": {
+                "token_env": "SPARK_A2A_TOKEN",
+                "on_behalf_of": ["brett"],
+                "capabilities": ["system.proof"],
+            }
+        }})
+        adapter = A2AAdapter(cfg)
+        identity = security.authenticate_bearer("Bearer secret", adapter.extra)
+        params = {"message": {
+            **protocol.text_message("user", "hello"),
+            "metadata": {"on_behalf_of": "brett", "capability": "system.proof"},
+        }}
+        policy, denial = adapter._request_policy(params, identity)
+        assert policy is None
+        assert denial == "capability has no configured tool grant"
 
 
 # --------------------------------------------------------------------------

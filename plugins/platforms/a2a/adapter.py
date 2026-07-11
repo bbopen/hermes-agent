@@ -38,8 +38,10 @@ from gateway.platforms.base import (
     SendResult,
 )
 from gateway.config import Platform
+from gateway.session import build_session_key
 
 from . import protocol, security
+from .runtime_policy import ActivePolicy, activate, deactivate
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +49,12 @@ _DEFAULT_PORT = 9900
 _REPLY_TIMEOUT = 300  # seconds to wait for the agent to answer an inbound task
 
 
-def _default_agent_name() -> str:
-    name = os.getenv("A2A_AGENT_NAME", "").strip()
+class _AgentShuttingDown(RuntimeError):
+    pass
+
+
+def _default_agent_name(extra: Optional[dict] = None) -> str:
+    name = str((extra or {}).get("agent_name") or os.getenv("A2A_AGENT_NAME", "")).strip()
     if name:
         return name
     try:
@@ -67,8 +73,10 @@ class A2AAdapter(BasePlatformAdapter):
 
         extra = getattr(config, "extra", {}) or {}
         self.port = int(os.getenv("A2A_PORT") or extra.get("port", _DEFAULT_PORT))
-        self.host = security.resolve_bind_host()
-        self.agent_name = _default_agent_name()
+        self.host = security.resolve_bind_host(extra)
+        self.agent_name = _default_agent_name(extra)
+        self.extra = extra
+        self.reply_timeout = max(1, int(extra.get("reply_timeout", _REPLY_TIMEOUT)))
 
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._server_thread: Optional[threading.Thread] = None
@@ -123,7 +131,10 @@ class A2AAdapter(BasePlatformAdapter):
             def do_POST(self):  # noqa: N802
                 # Auth (only meaningful when a token is configured; otherwise
                 # we are localhost-only by construction).
-                if not security.check_bearer(self.headers.get("Authorization")):
+                identity = security.authenticate_bearer(
+                    self.headers.get("Authorization"), adapter.extra
+                )
+                if identity is None:
                     self._json(401, protocol.jsonrpc_error(None, -32001, "unauthorized"))
                     return
                 try:
@@ -139,8 +150,12 @@ class A2AAdapter(BasePlatformAdapter):
                 params = req.get("params", {}) or {}
 
                 if method in ("message/send", "message/stream"):
+                    policy, denial = adapter._request_policy(params, identity)
+                    if denial:
+                        self._json(403, protocol.jsonrpc_error(req_id, -32003, denial))
+                        return
                     # We answer message/stream as a single (non-streamed) result.
-                    result = adapter._handle_inbound_task(params)
+                    result = adapter._handle_inbound_task(params, policy)
                     self._json(200, protocol.jsonrpc_result(req_id, result))
                     return
                 if method == "tasks/get":
@@ -163,7 +178,7 @@ class A2AAdapter(BasePlatformAdapter):
         self._server_thread.start()
         self._mark_connected()
 
-        exposure = "localhost-only" if security.localhost_only() else "REMOTE (bearer auth)"
+        exposure = "localhost-only" if security.localhost_only(self.extra) else "REMOTE (bearer auth)"
         logger.info(
             "A2A: serving Agent Card + JSON-RPC on http://%s:%s (%s) as %r",
             self.host, self.port, exposure, self.agent_name,
@@ -183,7 +198,7 @@ class A2AAdapter(BasePlatformAdapter):
         with self._pending_lock:
             for fut in self._pending_replies.values():
                 if not fut.done():
-                    fut.set_result("[agent shutting down]")
+                    fut.set_exception(_AgentShuttingDown("agent shutting down"))
             self._pending_replies.clear()
 
     # ── Agent Card ────────────────────────────────────────────────────────
@@ -198,39 +213,81 @@ class A2AAdapter(BasePlatformAdapter):
         return protocol.build_agent_card(
             name=self.agent_name,
             url=f"http://{self.host}:{self.port}/",
-            description=os.getenv(
+            description=str(self.extra.get("agent_description") or os.getenv(
                 "A2A_AGENT_DESCRIPTION",
                 "Hermes Agent — a general-purpose agent reachable over A2A.",
-            ),
+            )),
             skills=protocol.skills_from_toolsets(toolsets),
             streaming=False,
-            auth_required=not security.localhost_only(),
+            auth_required=not security.localhost_only(self.extra),
         )
 
     # ── Inbound task handling ─────────────────────────────────────────────
 
-    def _handle_inbound_task(self, params: dict) -> dict:
+    def _request_policy(self, params: dict, identity: security.PeerIdentity):
+        message = params.get("message", {}) or {}
+        metadata = message.get("metadata") or params.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        on_behalf_of = str(metadata.get("on_behalf_of") or "").strip()
+        capability = str(metadata.get("capability") or "").strip()
+        denial = security.authorize_claims(identity, on_behalf_of, capability)
+        if denial:
+            return None, denial
+
+        if identity.legacy:
+            allowed_tools = frozenset({"*"})
+        else:
+            cap_tools = self.extra.get("capability_tools") or {}
+            raw_tools = cap_tools.get(capability) if isinstance(cap_tools, dict) else None
+            if raw_tools is None:
+                return None, "capability has no configured tool grant"
+            allowed_tools = frozenset(str(v) for v in raw_tools)
+
+        return ActivePolicy(
+            principal=identity.principal,
+            on_behalf_of=on_behalf_of,
+            capability=capability,
+            allowed_tools=allowed_tools,
+        ), None
+
+    def _handle_inbound_task(self, params: dict, policy: ActivePolicy) -> dict:
         """Route an inbound A2A task into the live session and wait for reply.
 
         Runs on an HTTP worker thread. It marshals a MessageEvent onto the
         gateway loop and blocks (on a Future) until adapter.send() fulfils it.
         """
         text = protocol.extract_text(params)
-        peer = str(params.get("peer") or (params.get("message", {}) or {}).get("from") or "remote-agent")
+        peer = policy.principal
         context_id = (params.get("message", {}) or {}).get("contextId") or protocol.new_context_id()
         task_id = protocol.new_task_id()
 
         if not text:
             return protocol.build_task(task_id, context_id, protocol.STATE_FAILED, "Empty task — nothing to do.")
 
-        framed = security.wrap_inbound(peer, text)
-        security.audit("inbound", peer, task_id, text)
+        framed = security.wrap_inbound(
+            peer,
+            text,
+            on_behalf_of=policy.on_behalf_of,
+            capability=policy.capability,
+        )
+        security.audit(
+            "inbound", peer, task_id, text,
+            on_behalf_of=policy.on_behalf_of,
+            capability=policy.capability,
+        )
         protocol.persist_message(context_id, "user", text, task_id)
 
         if self._loop is None or self._message_handler is None:
             return protocol.build_task(
                 task_id, context_id, protocol.STATE_FAILED,
                 "Agent gateway not ready to accept A2A tasks.",
+            )
+
+        if not activate(context_id, policy):
+            return protocol.build_task(
+                task_id, context_id, protocol.STATE_FAILED,
+                "Another task is already active for this context.",
             )
 
         fut: Future = Future()
@@ -246,6 +303,11 @@ class A2AAdapter(BasePlatformAdapter):
                 chat_type="dm",
                 user_id=peer,
                 user_name=peer,
+                # The HTTP edge already bound this identity to a matched peer
+                # secret and capability policy.  Mark it authorized so the
+                # generic gateway allowlist cannot replace that stronger gate
+                # with caller-controlled pairing behavior.
+                role_authorized=True,
             ),
             message_id=task_id,
         )
@@ -255,20 +317,55 @@ class A2AAdapter(BasePlatformAdapter):
         except Exception as e:
             with self._pending_lock:
                 self._pending_replies.pop(context_id, None)
+            deactivate(context_id)
             return protocol.build_task(task_id, context_id, protocol.STATE_FAILED, f"Dispatch failed: {e}")
 
         try:
-            reply = fut.result(timeout=_REPLY_TIMEOUT)
+            reply = fut.result(timeout=self.reply_timeout)
+            state = protocol.STATE_COMPLETED
+        except _AgentShuttingDown:
+            reply = "[agent shutting down]"
+            state = protocol.STATE_FAILED
         except Exception:
             reply = "[agent did not reply in time]"
+            state = protocol.STATE_FAILED
+            # A timeout is an execution boundary, not only an HTTP waiting
+            # boundary. Cancel the gateway session so the model cannot keep
+            # running tools after the caller has given up and the capability
+            # policy has been removed.
+            try:
+                session_key = build_session_key(
+                    event.source,
+                    group_sessions_per_user=self.config.extra.get(
+                        "group_sessions_per_user", True
+                    ),
+                    thread_sessions_per_user=self.config.extra.get(
+                        "thread_sessions_per_user", False
+                    ),
+                )
+                cancel = asyncio.run_coroutine_threadsafe(
+                    self.cancel_session_processing(session_key), self._loop
+                )
+                cancel.result(timeout=5)
+            except Exception:
+                logger.warning(
+                    "A2A: timed-out session cancellation failed for context %s",
+                    context_id,
+                    exc_info=True,
+                )
         finally:
             with self._pending_lock:
                 self._pending_replies.pop(context_id, None)
+            deactivate(context_id)
 
         reply = security.redact_outbound(reply or "")
         protocol.persist_message(context_id, "agent", reply, task_id)
-        security.audit("outbound", peer, task_id, reply)
-        return protocol.build_task(task_id, context_id, protocol.STATE_COMPLETED, reply)
+        security.audit(
+            "outbound", peer, task_id, reply,
+            on_behalf_of=policy.on_behalf_of,
+            capability=policy.capability,
+        )
+        return protocol.build_task(task_id, context_id, state, reply)
 
     # ── Sending (the agent's reply path) ──────────────────────────────────
 
