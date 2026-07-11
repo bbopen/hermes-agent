@@ -30,6 +30,7 @@ import logging
 import math
 import os
 import queue
+import re
 import socket
 import ssl
 import threading
@@ -46,6 +47,15 @@ logger = logging.getLogger(__name__)
 _DEFAULT_TIMEOUT = 120
 _MAX_OUTBOUND_REQUEST_BYTES = 256 * 1024
 _MAX_OUTBOUND_RESPONSE_BYTES = 512 * 1024
+_SAFE_EXTERNAL_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _unsafe_metadata_field(name: str, value: str, *, external_id: bool = False) -> str:
+    if security.redact_public_text(value) != value:
+        return f"Error: {name} contains credential-shaped content; request was not sent."
+    if external_id and value and not _SAFE_EXTERNAL_ID.fullmatch(value):
+        return f"Error: {name} must contain only letters, digits, '_' or '-'."
+    return ""
 
 
 def _remaining(deadline: float) -> float:
@@ -424,6 +434,9 @@ def a2a_call(args: dict, **_: Any) -> str:
     capability = str(args.get("capability") or "").strip()
     if not agent or not message:
         return "Error: both 'agent' and 'message' are required."
+    unsafe = _unsafe_metadata_field("agent", agent)
+    if unsafe:
+        return unsafe
 
     peer = _resolve_peer(agent)
     if not peer or not peer.get("url"):
@@ -456,6 +469,16 @@ def a2a_call(args: dict, **_: Any) -> str:
     request_deadline = time.monotonic() + timeout
     on_behalf_of = on_behalf_of or peer.get("on_behalf_of", "")
     capability = capability or peer.get("capability", "")
+    for field_name, value, external_id in (
+        ("on_behalf_of", on_behalf_of, False),
+        ("capability", capability, False),
+        ("context_id", context_id, True),
+    ):
+        unsafe = _unsafe_metadata_field(
+            field_name, value, external_id=external_id,
+        )
+        if unsafe:
+            return unsafe
 
     ctx = context_id or protocol.new_context_id()
     safe_message = security.redact_outbound(message)

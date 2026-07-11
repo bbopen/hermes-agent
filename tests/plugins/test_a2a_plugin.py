@@ -879,6 +879,7 @@ class TestClientTools:
 
         def fake_post(url, body, headers, timeout):
             captured["body"] = body
+            captured["headers"] = headers
             return protocol.jsonrpc_result(
                 body["id"],
                 protocol.build_task("t", body["params"]["message"].get("contextId", "c1"),
@@ -897,7 +898,25 @@ class TestClientTools:
         sent = captured["body"]["params"]["message"]["parts"][0]["text"]
         assert all(secret not in sent for secret in secrets)
         assert captured["body"]["jsonrpc"] == "2.0"
+        assert captured["headers"]["A2A-Version"] == protocol.PROTOCOL_VERSION
         assert captured["body"]["params"]["deadline"] > time.time()
+
+    @pytest.mark.parametrize("field", ["on_behalf_of", "capability", "context_id"])
+    def test_credential_shaped_identity_and_routing_fields_fail_before_post(
+        self, monkeypatch, field,
+    ):
+        monkeypatch.setattr(tools, "_load_config", lambda: {
+            "a2a_agents": {"peer": {"url": "http://localhost:9999"}}
+        })
+        monkeypatch.setattr(
+            tools, "_http_post_json",
+            lambda *args: pytest.fail("unsafe metadata reached the wire"),
+        )
+        secret = "github_pat_11AA22bb33CC44dd55EE66ff77GG88hh"
+        args = {"agent": "peer", "message": "safe", field: secret}
+        out = tools.a2a_call(args)
+        assert field in out
+        assert "request was not sent" in out
 
     def test_call_reads_secret_from_key_env_and_sends_provenance(self, monkeypatch):
         monkeypatch.setenv("WORKER_A2A_TOKEN", "dedicated-secret")
@@ -1616,7 +1635,7 @@ class TestPrincipalBoundTaskHTTP:
                 "jsonrpc": "2.0", "id": "invalid-version",
                 "method": "message/send", "params": valid_params,
             }
-            for invalid_version in ("1.0", "0.3.0", "garbage"):
+            for invalid_version in (None, "1.0", "0.3.0", "garbage"):
                 with pytest.raises(urllib.error.HTTPError) as rejected:
                     await asyncio.to_thread(
                         post, versioned, "token-a", "a-current", invalid_version,
@@ -1763,6 +1782,7 @@ class TestPrincipalBoundTaskHTTP:
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {token}",
                     "X-A2A-Key-Id": "profile-current",
+                    "A2A-Version": protocol.PROTOCOL_VERSION,
                 },
                 method="POST",
             )
@@ -1894,7 +1914,11 @@ class TestInboundRoundTrip:
         s.close()
         monkeypatch.setenv("A2A_PORT", str(port))
 
-        cfg = PlatformConfig(enabled=True)
+        card_secret = "AIza" + "A" * 35
+        cfg = PlatformConfig(enabled=True, extra={
+            "agent_name": f"worker-{card_secret}",
+            "agent_description": f"description {card_secret}",
+        })
         adapter = A2AAdapter(cfg)
 
         # Mock the agent: when handle_message is called, immediately "reply"
@@ -1919,7 +1943,10 @@ class TestInboundRoundTrip:
 
             card = await asyncio.to_thread(_get, base + "/.well-known/agent.json")
             assert card["name"]
+            assert card_secret not in json.dumps(card)
             assert "security" not in card  # localhost-only, no auth advertised
+            health = await asyncio.to_thread(_get, base + "/health")
+            assert card_secret not in json.dumps(health)
 
             # 2) message/send
             body = {
@@ -1930,7 +1957,10 @@ class TestInboundRoundTrip:
             def _post():
                 req = urllib.request.Request(
                     base + "/", data=json.dumps(body).encode(),
-                    headers={"Content-Type": "application/json"}, method="POST",
+                    headers={
+                        "Content-Type": "application/json",
+                        "A2A-Version": protocol.PROTOCOL_VERSION,
+                    }, method="POST",
                 )
                 with urllib.request.urlopen(req, timeout=10) as r:
                     return json.loads(r.read().decode())
@@ -2001,7 +2031,10 @@ class TestInboundRoundTrip:
                     "params": {"message": protocol.text_message("user", "x")}}
             req = urllib.request.Request(
                 base + "/", data=json.dumps(body).encode(),
-                headers={"Content-Type": "application/json"}, method="POST")
+                headers={
+                    "Content-Type": "application/json",
+                    "A2A-Version": protocol.PROTOCOL_VERSION,
+                }, method="POST")
             try:
                 urllib.request.urlopen(req, timeout=5)
                 raise AssertionError("expected 401")

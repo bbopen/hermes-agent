@@ -189,7 +189,7 @@ class A2AAdapter(BasePlatformAdapter):
         with self._profile_runtime_scope():
             self.host = security.resolve_bind_host(extra)
             self._localhost_only = security.localhost_only(extra)
-        self.agent_name = _default_agent_name(extra)
+        self.agent_name = security.redact_public_text(_default_agent_name(extra))
         self.reply_timeout = _bounded_int(
             extra.get("reply_timeout", _REPLY_TIMEOUT),
             _REPLY_TIMEOUT,
@@ -472,11 +472,8 @@ class A2AAdapter(BasePlatformAdapter):
                     ))
                     return
                 if (
-                    requested_versions
-                    and (
-                        len(requested_versions) != 1
-                        or requested_versions[0] != protocol.PROTOCOL_VERSION
-                    )
+                    len(requested_versions) != 1
+                    or requested_versions[0] != protocol.PROTOCOL_VERSION
                 ):
                     self._json(400, protocol.jsonrpc_error(
                         req_id,
@@ -657,20 +654,26 @@ class A2AAdapter(BasePlatformAdapter):
             toolsets = list(extra.get("advertised_toolsets") or [])
         except Exception:
             pass
+        description = security.redact_public_text(str(
+            self.extra.get("agent_description") or os.getenv(
+                "A2A_AGENT_DESCRIPTION",
+                "Hermes Agent — a general-purpose agent reachable over A2A.",
+            )
+        ))
+        safe_toolsets = [security.redact_public_text(str(name)) for name in toolsets]
         card = protocol.build_agent_card(
             name=self.agent_name,
             url=f"http://{self.host}:{self.port}/",
-            description=str(self.extra.get("agent_description") or os.getenv(
-                "A2A_AGENT_DESCRIPTION",
-                "Hermes Agent — a general-purpose agent reachable over A2A.",
-            )),
-            skills=protocol.skills_from_toolsets(toolsets),
+            description=description,
+            skills=protocol.skills_from_toolsets(safe_toolsets),
             streaming=False,
             auth_required=security.requires_auth(self.extra),
         )
         grants = self.extra.get("capability_tools") or {}
         if isinstance(grants, dict):
-            card["x-hermes-capabilities"] = sorted(str(name) for name in grants)
+            card["x-hermes-capabilities"] = sorted(
+                security.redact_public_text(str(name)) for name in grants
+            )
         return card
 
     # ── Inbound task handling ─────────────────────────────────────────────

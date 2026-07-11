@@ -423,6 +423,26 @@ def redact_outbound(text: str) -> str:
     )
 
 
+def redact_public_text(text: str) -> str:
+    """Redact a short public metadata field, including embedded key substrings."""
+    redacted = redact_outbound(text)
+    if redacted != text or not text:
+        return redacted
+    # The shared redactor deliberately applies token-boundary guards for log
+    # fidelity. Public metadata has no reason to retain a field containing a
+    # credential after punctuation (for example ``worker-AIza...``), so probe
+    # every suffix through the same forced corpus and redact the whole field.
+    from agent.redact import redact_sensitive_text
+
+    for index in range(1, len(text)):
+        if text[index - 1].isalnum():
+            continue
+        probe = " " + text[index:]
+        if redact_sensitive_text(probe, force=True)[1:] != text[index:]:
+            return "[redacted]"
+    return text
+
+
 # --------------------------------------------------------------------------
 # Audit log
 # --------------------------------------------------------------------------
