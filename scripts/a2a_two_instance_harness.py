@@ -14,25 +14,39 @@ import asyncio
 import json
 import os
 from pathlib import Path
+import selectors
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
-import time
 
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+# Make direct invocation from scripts/ behave like the canonical repository
+# runner without requiring callers to remember PYTHONPATH=.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 async def _run_worker(port: int, worker_home: Path) -> None:
     from gateway.config import PlatformConfig
     from plugins.platforms.a2a.adapter import A2AAdapter
 
-    adapter = A2AAdapter(PlatformConfig(enabled=True))
+    adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+        "host": "127.0.0.1",
+        "port": port,
+        "agent_name": "apple-worker-harness",
+        "trusted_peers": {
+            "harness-primary": {
+                "credentials": [{
+                    "key_id": "harness-current",
+                    "token_env": "HARNESS_A2A_TOKEN",
+                }],
+                "on_behalf_of": ["harness"],
+                "capabilities": ["harness.proof"],
+            },
+        },
+        "capability_tools": {"harness.proof": []},
+    }))
     turns: dict[str, int] = {}
 
     async def execute_mac_local_task(event):
@@ -63,7 +77,7 @@ async def _run_worker(port: int, worker_home: Path) -> None:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
-    print(json.dumps({"ready": True, "port": port}), flush=True)
+    print(json.dumps({"ready": True, "port": adapter.port}), flush=True)
     await stop.wait()
     await adapter.disconnect()
 
@@ -89,15 +103,12 @@ def _primary_main() -> int:
     with tempfile.TemporaryDirectory(prefix="hermes-a2a-primary-") as primary_dir, tempfile.TemporaryDirectory(
         prefix="hermes-a2a-worker-"
     ) as worker_dir:
-        port = _free_port()
+        port = 0
         env = os.environ.copy()
         env.update(
             {
                 "HERMES_HOME": worker_dir,
-                "A2A_BEARER_TOKEN": token,
-                "A2A_HOST": "127.0.0.1",
-                "A2A_PORT": str(port),
-                "A2A_AGENT_NAME": "apple-worker-harness",
+                "HARNESS_A2A_TOKEN": token,
             }
         )
         proc = subprocess.Popen(
@@ -116,25 +127,41 @@ def _primary_main() -> int:
             text=True,
         )
         try:
-            deadline = time.monotonic() + 10
             ready = ""
-            while time.monotonic() < deadline:
-                ready = proc.stdout.readline() if proc.stdout else ""
-                if ready:
-                    break
-                if proc.poll() is not None:
-                    break
+            if proc.stdout is not None:
+                selector = selectors.DefaultSelector()
+                selector.register(proc.stdout, selectors.EVENT_READ)
+                events = selector.select(timeout=10)
+                if events:
+                    ready = proc.stdout.readline()
+                selector.close()
             if not ready:
                 stderr = proc.stderr.read() if proc.stderr else ""
                 raise RuntimeError(f"worker failed to become ready: {stderr}")
-            assert json.loads(ready)["ready"] is True
+            readiness = json.loads(ready)
+            assert readiness["ready"] is True
+            port = int(readiness["port"])
 
             os.environ["HERMES_HOME"] = primary_dir
-            tools._resolve_peer = lambda _agent: {  # type: ignore[assignment]
-                "url": f"http://127.0.0.1:{port}",
-                "auth": {"type": "bearer", "token": token},
-                "timeout": 10,
-            }
+            os.environ["HARNESS_PRIMARY_A2A_TOKEN"] = token
+            Path(primary_dir, "config.yaml").write_text(
+                json.dumps({
+                    "a2a_agents": {
+                        "apple-worker": {
+                            "url": f"http://127.0.0.1:{port}",
+                            "auth": {
+                                "type": "bearer",
+                                "key_id": "harness-current",
+                                "key_env": "HARNESS_PRIMARY_A2A_TOKEN",
+                            },
+                            "timeout": 10,
+                            "on_behalf_of": "harness",
+                            "capability": "harness.proof",
+                        }
+                    }
+                }),
+                encoding="utf-8",
+            )
 
             first = tools.a2a_call({"agent": "apple-worker", "message": "write bounded proof"})
             context_id = _context_from_reply(first)

@@ -16,7 +16,10 @@ description: >
   that replies is the same one talking to its user, with full memory and
   context, not a throwaway clone.
 
-  Security is on by default: no bearer token configured => localhost-only bind.
+  Security is on by default: without active named trusted-peer credentials the
+  listener is fixed to numeric loopback. A legacy local bearer may protect that
+  loopback listener, but remote delegation requires explicit principal, key-id,
+  OBO, capability, and exact tool-grant policy in config.yaml.
   Inbound task text passes through prompt-injection filters; outbound text is
   scrubbed of credential-shaped strings; every exchange is audit-logged and
   persisted to disk outside the context-compaction pipeline so conversations
@@ -29,26 +32,6 @@ author: Nous Research
 requires_env: []
 optional_env:
   - name: A2A_BEARER_TOKEN
-    description: "Bearer token required on inbound A2A calls. UNSET => bind to 127.0.0.1 only (no remote access)."
-    prompt: "A2A bearer token (or empty for localhost-only)"
+    description: "Optional legacy token for loopback requests only. Remote peers require trusted_peers keys in config.yaml."
+    prompt: "Legacy local A2A bearer token (or empty)"
     password: true
-  - name: A2A_HOST
-    description: "Inbound bind host. Defaults to 127.0.0.1; only widens to 0.0.0.0 when a bearer token is set AND you opt in here."
-    prompt: "A2A bind host (default 127.0.0.1)"
-    password: false
-  - name: A2A_PORT
-    description: "Inbound A2A server port (default 9900)."
-    prompt: "A2A port (default 9900)"
-    password: false
-  - name: A2A_AGENT_NAME
-    description: "Name advertised on this agent's Agent Card (default: hostname-derived)."
-    prompt: "A2A agent name"
-    password: false
-  - name: A2A_ALLOW_ALL_USERS
-    description: "Allow any authenticated A2A peer to reach the agent (dev only)."
-    prompt: "Allow all A2A peers? (true/false)"
-    password: false
-  - name: A2A_HOME_CHANNEL
-    description: "Task/context id used as the cron / notification delivery target for deliver=a2a."
-    prompt: "A2A home channel (or empty)"
-    password: false

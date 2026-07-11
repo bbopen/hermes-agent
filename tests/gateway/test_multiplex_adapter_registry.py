@@ -117,6 +117,27 @@ class TestPortBindingHardError:
         assert "reviewer" in str(ei.value)
 
     @pytest.mark.asyncio
+    async def test_secondary_a2a_raises_profile_owned_listener_error(self, monkeypatch):
+        from gateway.run import MultiplexConfigError
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner._profile_adapters = {}
+        reviewer_cfg = GatewayConfig(multiplex_profiles=True)
+        reviewer_cfg.platforms = {
+            Platform("a2a"): PlatformConfig(enabled=True, extra={"port": 9900}),
+        }
+        monkeypatch.setattr(
+            "gateway.config.load_gateway_config", lambda: reviewer_cfg
+        )
+
+        with pytest.raises(MultiplexConfigError) as raised:
+            await runner._start_one_profile_adapters("reviewer", "/tmp/x", {})
+        assert "profile-scoped authenticated listener" in str(raised.value)
+        assert "only the active/default profile" in str(raised.value)
+
+    @pytest.mark.asyncio
     async def test_secondary_non_binding_platform_ok(self, monkeypatch):
         """A non-port-binding platform (e.g. telegram) is NOT rejected."""
         from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -191,5 +212,5 @@ class TestPortBindingHardError:
         from gateway.run import _PORT_BINDING_PLATFORM_VALUES
         # Every adapter that binds a TCP port must be in the guard set.
         for p in ("webhook", "api_server", "msgraph_webhook", "feishu",
-                  "wecom_callback", "bluebubbles", "sms"):
+                  "wecom_callback", "bluebubbles", "sms", "a2a"):
             assert p in _PORT_BINDING_PLATFORM_VALUES

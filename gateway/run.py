@@ -1397,6 +1397,10 @@ _PORT_BINDING_PLATFORM_VALUES = frozenset({
     "sms",
     "whatsapp_cloud",
     "line",
+    # A2A owns a task store and authenticated listener per profile. It cannot
+    # safely be a secondary multiplex adapter: that would create a second
+    # control plane with ambiguous credential/profile ownership.
+    "a2a",
 })
 
 
@@ -8568,6 +8572,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # /p/<profile>/ prefix, so a second bind can only collide. This is a
             # config error, not a transient failure — fail fast and loud.
             if platform.value in _PORT_BINDING_PLATFORM_VALUES:
+                if platform.value == "a2a":
+                    raise MultiplexConfigError(
+                        f"Profile '{profile_name}' enables A2A while "
+                        "gateway.multiplex_profiles is on. A2A owns a "
+                        "profile-scoped authenticated listener and durable task "
+                        "store; only the active/default profile may enable it in "
+                        "a multiplexed gateway. Remove platforms.a2a from profile "
+                        f"'{profile_name}'s config.yaml."
+                    )
                 raise MultiplexConfigError(
                     f"Profile '{profile_name}' enables the port-binding platform "
                     f"'{platform.value}', but gateway.multiplex_profiles is on. The "

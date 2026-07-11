@@ -7,8 +7,8 @@ private context to a peer we don't fully trust. Both directions are hardened
 here so neither the adapter nor the tools have to re-implement it.
 
 Layers (all opt-out-able only by explicit config, never silently):
-  1. Bind safety       — no bearer token => 127.0.0.1 only (enforced in adapter)
-  2. Bearer auth       — constant-time token comparison
+  1. Bind safety       — named remote credentials or verified numeric loopback
+  2. Bearer auth       — unambiguous key id plus constant-time token comparison
   3. Injection filters — strip ChatML / role-prefix / override patterns from
                          inbound task text before it reaches the agent
   4. Outbound redaction — scrub credential-shaped strings from anything we send
@@ -18,8 +18,10 @@ Layers (all opt-out-able only by explicit config, never silently):
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import hashlib
@@ -39,7 +41,19 @@ logger = logging.getLogger(__name__)
 
 def get_bearer_token() -> str:
     """Return the configured inbound bearer token (empty string if none)."""
-    return os.getenv("A2A_BEARER_TOKEN", "").strip()
+    return _credential_value("A2A_BEARER_TOKEN")
+
+
+def _credential_value(name: str) -> str:
+    """Resolve A2A credentials from the active profile scope, fail closed."""
+    try:
+        from agent.secret_scope import get_secret
+
+        return str(get_secret(name, "") or "").strip()
+    except Exception:
+        # In a multiplexed gateway an unscoped credential read is a security
+        # error, not a reason to fall back to another profile's environment.
+        return ""
 
 
 def check_bearer(auth_header: Optional[str]) -> bool:
@@ -104,16 +118,20 @@ def _expires_at(value: Any) -> Optional[float]:
         # Treat values in milliseconds as such; normal Unix timestamps remain
         # seconds.  It makes automated rotations unambiguous without requiring
         # a second configuration field.
-        return float(value) / 1000 if value > 10_000_000_000 else float(value)
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            return -1.0
+        return parsed / 1000 if parsed > 10_000_000_000 else parsed
     if not isinstance(value, str):
         return -1.0
     try:
         if value.replace(".", "", 1).isdigit():
             return _expires_at(float(value))
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00")).replace(
             tzinfo=datetime.fromisoformat(value.replace("Z", "+00:00")).tzinfo or timezone.utc
         ).timestamp()
-    except (TypeError, ValueError):
+        return parsed if math.isfinite(parsed) else -1.0
+    except (TypeError, ValueError, OverflowError, OSError):
         return -1.0
 
 
@@ -143,7 +161,8 @@ def configured_trusted_peers(
     next request.  Key ids are globally unambiguous to prevent a bearer token
     from being attributed to the wrong principal after a hot config reload.
     """
-    result: list[tuple[PeerIdentity, PeerCredential]] = []
+    candidates: list[tuple[PeerIdentity, PeerCredential]] = []
+    over_limit_principals: set[str] = set()
     peers = extra.get("trusted_peers") or {}
     if not isinstance(peers, Mapping):
         return result
@@ -164,26 +183,45 @@ def configured_trusted_peers(
                 or expires_at is not None and expires_at <= time.time()
             ):
                 continue
-            token = os.getenv(token_env, "").strip()
+            token = _credential_value(token_env)
             if not token:
                 continue
             active_for_principal += 1
-            result.append((
+            candidates.append((
                 PeerIdentity(str(principal), obo, caps, key_id=key_id),
                 PeerCredential(key_id=key_id, token=token),
             ))
         if active_for_principal > 2:
             logger.error("A2A: trusted peer %r has more than two active keys; rejecting it", principal)
-            result = [entry for entry in result if entry[0].principal != str(principal)]
+            over_limit_principals.add(str(principal))
 
     duplicate_ids = {
         credential.key_id
-        for _, credential in result
-        if sum(1 for _, candidate in result if candidate.key_id == credential.key_id) > 1
+        for _, credential in candidates
+        if sum(1 for _, candidate in candidates if candidate.key_id == credential.key_id) > 1
     }
     if duplicate_ids:
         logger.error("A2A: duplicate trusted-peer key ids rejected: %s", sorted(duplicate_ids))
-    return [entry for entry in result if entry[1].key_id not in duplicate_ids]
+    # Compute token ambiguity over the complete active candidate set before
+    # removing any other invalid entry. Otherwise overlapping key-id/token
+    # conflicts can leave one caller-selectable principal behind.
+    duplicate_token_indexes: set[int] = set()
+    for index, (_, credential) in enumerate(candidates):
+        for other_index, (_, candidate) in enumerate(candidates):
+            if index != other_index and hmac.compare_digest(
+                credential.token, candidate.token
+            ):
+                duplicate_token_indexes.add(index)
+                duplicate_token_indexes.add(other_index)
+    if duplicate_token_indexes:
+        logger.error("A2A: duplicate trusted-peer bearer values rejected")
+    return [
+        entry
+        for index, entry in enumerate(candidates)
+        if entry[0].principal not in over_limit_principals
+        and entry[1].key_id not in duplicate_ids
+        and index not in duplicate_token_indexes
+    ]
 
 
 def _has_trusted_peer_config(extra: Mapping[str, Any]) -> bool:
@@ -192,7 +230,11 @@ def _has_trusted_peer_config(extra: Mapping[str, Any]) -> bool:
 
 
 def authenticate_bearer(
-    auth_header: Optional[str], extra: Mapping[str, Any], key_id: Optional[str] = None,
+    auth_header: Optional[str],
+    extra: Mapping[str, Any],
+    key_id: Optional[str] = None,
+    *,
+    local_request: bool = False,
 ) -> Optional[PeerIdentity]:
     """Return the identity bound to the presented bearer secret.
 
@@ -201,12 +243,12 @@ def authenticate_bearer(
     configured = configured_trusted_peers(extra)
     presented = _presented_bearer(auth_header)
     if configured or _has_trusted_peer_config(extra):
-        if not presented:
-            return None
         requested_key_id = str(key_id or "").strip()
+        if not presented or not requested_key_id:
+            return None
         candidates = [
             (identity, credential) for identity, credential in configured
-            if not requested_key_id or credential.key_id == requested_key_id
+            if credential.key_id == requested_key_id
         ]
         matches = [
             identity for identity, credential in candidates
@@ -216,14 +258,18 @@ def authenticate_bearer(
 
     # Backwards-compatible single-token and localhost modes.  They remain
     # useful for tests and local development but do not provide provenance.
-    if not get_bearer_token():
+    if not get_bearer_token() and local_request:
         return PeerIdentity(
             "localhost", frozenset({"*"}), frozenset({"*"}), legacy=True, local=True,
         )
-    if check_bearer(auth_header):
-        # A historical global bearer never gains remote wildcard delegation.
-        # Operators must migrate it to trusted_peers with named keys/grants.
-        return PeerIdentity("legacy-bearer", frozenset(), frozenset(), legacy=True)
+    if local_request and check_bearer(auth_header):
+        return PeerIdentity(
+            "legacy-loopback",
+            frozenset({"*"}),
+            frozenset({"*"}),
+            legacy=True,
+            local=True,
+        )
     return None
 
 
@@ -261,30 +307,39 @@ def requires_auth(extra: Optional[Mapping[str, Any]] = None) -> bool:
 
 
 def localhost_only(extra: Optional[Mapping[str, Any]] = None) -> bool:
-    """True when we must refuse non-loopback binds (no bearer token set)."""
+    """True when no active named remote credential permits a wider bind."""
     return not has_inbound_credentials(extra)
 
 
 def resolve_bind_host(extra: Optional[Mapping[str, Any]] = None) -> str:
     """Resolve the safe inbound bind host.
 
-    Rule: localhost unless the operator BOTH set a bearer token AND explicitly
-    asked for a wider host. A token alone does not widen the bind — opting into
-    remote exposure must be deliberate.
+    Rule: numeric loopback unless the operator both configured an active named
+    trusted-peer credential and explicitly requested a wider host.
     """
     requested = str((extra or {}).get("host") or os.getenv("A2A_HOST", "")).strip()
     requested = requested or "127.0.0.1"
     loopback = {"127.0.0.1", "localhost", "::1"}
     if requested in loopback:
-        return requested
+        # ThreadingHTTPServer is IPv4 by default. More importantly, resolving
+        # the name localhost at bind time would make local trust depend on DNS.
+        return "127.0.0.1"
     if localhost_only(extra):
         logger.warning(
-            "A2A: A2A_HOST=%s ignored — no A2A_BEARER_TOKEN set; binding to "
-            "127.0.0.1. Configure a trusted peer token to expose A2A remotely.",
+            "A2A: requested host %s ignored — no active named trusted-peer "
+            "credential; binding to 127.0.0.1.",
             requested,
         )
         return "127.0.0.1"
     return requested
+
+
+def is_loopback_address(value: str) -> bool:
+    """Return true only for a numeric loopback peer address."""
+    try:
+        return ipaddress.ip_address(str(value).split("%", 1)[0]).is_loopback
+    except ValueError:
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -375,7 +430,7 @@ def _audit_path() -> Path:
         from hermes_constants import get_hermes_home
         base = Path(get_hermes_home())
     except Exception:
-        base = Path(os.path.expanduser("~/.hermes"))
+        base = Path(os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes"))
     return base / "a2a_audit.jsonl"
 
 
@@ -392,6 +447,7 @@ def audit(
     capability: str = "",
     request_id: str = "",
     status: str = "",
+    event_id: str = "",
 ) -> bool:
     """Append a privacy-safe audit record with owner-only file permissions.
 
@@ -409,6 +465,7 @@ def audit(
             "task_id": task_id,
             "request_id": request_id,
             "status": status,
+            "event_id": event_id,
             # Prompt and reply bodies are intentionally never audit records.
             # A hash permits correlation without creating a second sensitive
             # data store alongside the Hermes conversation state.
@@ -422,6 +479,22 @@ def audit(
                 os.chmod(path.parent, 0o700)
             except OSError:
                 pass
+            if event_id and path.exists():
+                # The SQLite outbox and JSONL append cannot share one atomic
+                # transaction. A stable event id closes the crash window: if
+                # append succeeded but the delivered mark did not, retry sees
+                # the existing sink record and acknowledges it without a
+                # duplicate terminal notification.
+                try:
+                    with path.open("r", encoding="utf-8") as existing:
+                        for line in existing:
+                            try:
+                                if json.loads(line).get("event_id") == event_id:
+                                    return True
+                            except (json.JSONDecodeError, AttributeError):
+                                continue
+                except (OSError, UnicodeError):
+                    pass
             fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
             try:
                 os.fchmod(fd, 0o600)

@@ -1,8 +1,10 @@
 # A2A Platform Plugin — Design
 
 Consolidates the entire A2A (Agent-to-Agent) feature cluster (#514 and friends)
-into one **plugin** with **zero core edits**, built on capabilities the current
-codebase already exposes.
+into one **plugin**, built primarily on capabilities the current codebase
+already exposes. The gateway has one narrow generic-listener integration: A2A
+is classified as a port-binding platform so secondary multiplex profiles fail
+fast instead of starting a second profile-owned control plane.
 
 ## Why a plugin, not a core feature
 
@@ -11,8 +13,9 @@ package (`a2a_adapter/`) and/or patched `gateway/run.py` + `gateway/config.py`.
 Since then the codebase grew `ctx.register_platform()` (the plugin
 platform-adapter API — used by irc, line, teams, ntfy, simplex, …) and
 `ctx.register_tool()`. That makes the standing policy achievable: **plugins
-must not touch core files.** A2A now lives entirely under
-`plugins/platforms/a2a/`.
+must not special-case product behavior in core files.** A2A behavior remains
+under `plugins/platforms/a2a/`; the gateway change only applies its existing
+secondary-profile listener gate.
 
 ## Two directions
 
@@ -38,21 +41,32 @@ Peers resolved from `config.yaml` → `a2a_agents`, or a direct URL.
   (async gateway → synchronous request/response for the caller).
 
 ## Security (on by default)
-- **Bind safety:** no `A2A_BEARER_TOKEN` ⇒ bind `127.0.0.1` only. A token alone
-  does not widen the bind; remote exposure requires token **and** explicit
-  `A2A_HOST`.
-- **Bearer auth:** constant-time (`hmac.compare_digest`) on inbound POST.
+- **Bind safety:** without an active named `trusted_peers` credential, bind
+  numeric `127.0.0.1` and verify the created socket is loopback. A legacy local
+  bearer never widens exposure.
+- **Bearer auth:** constant-time (`hmac.compare_digest`) on inbound POST;
+  remote identity requires an unambiguous key ID and token pair. Duplicate key
+  IDs or bearer values are rejected across the complete active key set.
+- **Authorization:** contexts/tasks are bound to principal, OBO, and capability;
+  exact tool grants are activated only for that live A2A context.
 - **Injection filters:** inbound text is defanged (ChatML / role-prefix /
   override patterns → `[filtered]`) and framed with a privacy prefix marking it
   untrusted peer input.
 - **Outbound redaction:** credential-shaped strings (`sk-…`, `ghp_…`, JWTs,
   bearer tokens, emails) scrubbed before anything leaves.
-- **Audit log:** append-only `~/.hermes/a2a_audit.jsonl` for every exchange.
+- **Audit log:** profile-scoped append-only `a2a_audit.jsonl`; pending delivery
+  is retained in a claimable SQLite outbox and retried without two live
+  instances delivering the same claim concurrently.
+- **Transport:** outbound DNS validation and the actual TCP connect share the
+  same resolved socket address. Redirects and cross-origin Agent Cards are
+  rejected before credentials can be forwarded.
 
 ## Persistence (survives compaction)
-A2A conversations are written to `~/.hermes/a2a_conversations/<context>.jsonl`,
-outside the context-compaction pipeline — compaction and restarts can't lose
-them (#11025 requirement).
+A2A conversations are written beneath the active profile at
+`a2a_conversations/<context>.jsonl`. Principal-bound task state, canonical
+request hashes, fenced execution leases, terminal immutability, and the audit
+outbox live at `a2a/control-plane/tasks.sqlite3`. A restart never redispatches
+an accepted request; an expired dispatched lease becomes explicitly uncertain.
 
 ## Requirements traced to the cluster
 
@@ -63,7 +77,7 @@ them (#11025 requirement).
 | #11025 | Live-session injection (not a clone) | `adapter._handle_inbound_task` |
 | #11025 | Privacy filters + outbound redaction + audit | `security.py` |
 | #11025 | Conversation persistence outside compaction | `protocol.persist_message` |
-| #514, #11025 | Bearer auth, localhost-default | `security.resolve_bind_host` |
+| #514, #11025 | Key-id bearer auth, verified localhost-default | `security.resolve_bind_host`, adapter bind check |
 | #25176, #689 | Agent↔agent messaging across machines | client tools + inbound adapter |
 
 ## Deliberately out of scope (future, not this PR)

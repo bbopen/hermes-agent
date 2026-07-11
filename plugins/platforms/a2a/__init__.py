@@ -5,14 +5,15 @@ Registers:
   - The ``a2a`` platform adapter (inbound: exposes Hermes as an A2A agent).
   - Three client tools in the ``a2a`` toolset (outbound: call other agents).
 
-Zero core edits — everything goes through the public PluginContext surface
-(``ctx.register_platform`` + ``ctx.register_tool``).
+Behavior is registered through the public PluginContext surface
+(``ctx.register_platform`` + ``ctx.register_tool``). The gateway's existing
+port-binding guard also classifies A2A so secondary multiplex profiles fail
+closed instead of starting another listener.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 
 logger = logging.getLogger(__name__)
 
@@ -22,8 +23,8 @@ __all__ = ["register"]
 def check_requirements() -> bool:
     """The inbound adapter is always loadable — stdlib only, no external deps.
 
-    It binds localhost-only unless a bearer token is configured, so it is safe
-    to enable by default once the user turns the platform on.
+    It binds numeric loopback unless active named trusted-peer credentials are
+    configured, so it is safe once the user explicitly enables the platform.
     """
     return True
 
@@ -39,49 +40,60 @@ def is_connected(config) -> bool:
     The gateway only instantiates enabled platforms, so reaching here means the
     operator opted in; the adapter itself enforces bind safety.
     """
-    extra = getattr(config, "extra", {}) or {}
-    return bool(extra.get("enabled")) or bool(os.getenv("A2A_PORT"))
+    return bool(getattr(config, "enabled", False))
 
 
 def interactive_setup() -> None:
     """`hermes gateway setup` flow for A2A."""
     from hermes_cli.setup import (
         prompt,
-        prompt_yes_no,
-        save_env_value,
-        get_env_value,
         print_header,
         print_info,
         print_warning,
     )
+    from hermes_cli.config import load_config, save_config
 
     print_header("A2A (Agent-to-Agent)")
     print_info("Expose Hermes as an A2A-discoverable agent and call other A2A agents.")
     print_info("Uses Python stdlib — no extra packages needed.")
     print()
 
-    port = prompt("Inbound A2A port (default 9900)", default=get_env_value("A2A_PORT") or "")
+    config = load_config() or {}
+    gateway = config.setdefault("gateway", {})
+    platforms = gateway.setdefault("platforms", {})
+    platform = platforms.setdefault("a2a", {})
+    platform["enabled"] = True
+    extra = platform.setdefault("extra", {})
+
+    port = prompt(
+        "Inbound A2A port (default 9900)",
+        default=str(extra.get("port") or ""),
+    )
     if port:
         try:
-            save_env_value("A2A_PORT", str(int(port)))
+            extra["port"] = int(port)
         except ValueError:
             print_warning("Invalid port — using default 9900")
 
-    name = prompt("Agent name to advertise (blank = hostname-derived)", default=get_env_value("A2A_AGENT_NAME") or "")
+    name = prompt(
+        "Agent name to advertise (blank = hostname-derived)",
+        default=str(extra.get("agent_name") or ""),
+    )
     if name:
-        save_env_value("A2A_AGENT_NAME", name.strip())
+        extra["agent_name"] = name.strip()
+    save_config(config, preserve_keys={
+        ("gateway", "platforms", "a2a", "enabled"),
+        ("gateway", "platforms", "a2a", "extra", "port"),
+        ("gateway", "platforms", "a2a", "extra", "agent_name"),
+    })
 
     print()
-    print_info("Security: with NO bearer token the server binds to 127.0.0.1 only.")
-    if prompt_yes_no("Set a bearer token to allow REMOTE A2A peers?", False):
-        token = prompt("Bearer token", password=True)
-        if token:
-            save_env_value("A2A_BEARER_TOKEN", token)
-            host = prompt("Bind host for remote access (e.g. 0.0.0.0)", default=get_env_value("A2A_HOST") or "")
-            if host:
-                save_env_value("A2A_HOST", host.strip())
-        else:
-            print_warning("No token entered — staying localhost-only.")
+    print_info(
+        "Security: A2A_BEARER_TOKEN is legacy loopback-only compatibility. "
+        "Remote A2A requires named trusted_peers credentials, key ids, and "
+        "explicit OBO/capability grants in config.yaml."
+    )
+    print_warning("Remote listener setup is intentionally config-only; no wildcard bearer setup is offered.")
 
 
 def register(ctx) -> None:
@@ -110,9 +122,6 @@ def register(ctx) -> None:
             install_hint="No extra packages needed (stdlib only)",
             setup_fn=interactive_setup,
             emoji="\U0001f9e9",  # puzzle piece
-            allowed_users_env="A2A_ALLOWED_USERS",
-            allow_all_env="A2A_ALLOW_ALL_USERS",
-            cron_deliver_env_var="A2A_HOME_CHANNEL",
             allow_update_command=False,
             platform_hint=(
                 "You are reachable over the A2A (Agent-to-Agent) protocol. "

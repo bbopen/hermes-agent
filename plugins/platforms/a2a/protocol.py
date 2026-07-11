@@ -49,10 +49,9 @@ def build_agent_card(
         "description": description,
         "url": url,
         "version": "0.1.0",
-        # The adapter implements the A2A v1.0 task/status subset it advertises:
-        # message/send, tasks/get, tasks/cancel, and durable terminal states.
-        # It intentionally does not claim streaming/push/history support.
-        "protocolVersion": "1.0",
+        # Hermes implements a conservative interoperable subset; do not claim
+        # A2A v1.0 conformance until every required v1 lifecycle surface exists.
+        "protocolVersion": "0.3",
         "capabilities": {
             "streaming": streaming,
             "pushNotifications": False,
@@ -114,12 +113,12 @@ def new_context_id() -> str:
     return "ctx-" + uuid.uuid4().hex[:16]
 
 
-def text_message(role: str, text: str) -> dict:
+def text_message(role: str, text: str, *, message_id: Optional[str] = None) -> dict:
     """Build an A2A Message with a single text Part."""
     return {
         "role": role,  # "user" | "agent"
         "parts": [{"kind": "text", "text": text}],
-        "messageId": uuid.uuid4().hex,
+        "messageId": message_id or uuid.uuid4().hex,
     }
 
 
@@ -142,25 +141,36 @@ def extract_text(message_or_params: dict) -> str:
     return "\n".join(chunks).strip()
 
 
-def build_task(task_id: str, context_id: str, state: str, agent_text: str = "") -> dict:
+def build_task(
+    task_id: str,
+    context_id: str,
+    state: str,
+    agent_text: str = "",
+    *,
+    timestamp: Optional[float] = None,
+) -> dict:
     """Build an A2A Task object for a message/send result."""
     task: dict[str, Any] = {
         "id": task_id,
         "contextId": context_id,
-        "status": {"state": state, "timestamp": _now_iso()},
+        "status": {"state": state, "timestamp": _now_iso(timestamp)},
         "kind": "task",
     }
     if agent_text:
-        task["status"]["message"] = text_message("agent", agent_text)
+        task["status"]["message"] = text_message(
+            "agent", agent_text, message_id=f"{task_id}-status"
+        )
         task["artifacts"] = [{
-            "artifactId": uuid.uuid4().hex,
+            "artifactId": f"{task_id}-artifact",
             "parts": [{"kind": "text", "text": agent_text}],
         }]
     return task
 
 
-def _now_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+def _now_iso(timestamp: Optional[float] = None) -> str:
+    return time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() if timestamp is None else timestamp)
+    )
 
 
 # --------------------------------------------------------------------------
@@ -176,7 +186,7 @@ def _conv_dir() -> Path:
         from hermes_constants import get_hermes_home
         base = Path(get_hermes_home())
     except Exception:
-        base = Path(os.path.expanduser("~/.hermes"))
+        base = Path(os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes"))
     return base / "a2a_conversations"
 
 

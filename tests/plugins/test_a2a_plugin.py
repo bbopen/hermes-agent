@@ -11,6 +11,7 @@ import asyncio
 from concurrent.futures import Future
 import json
 import os
+import sqlite3
 import stat
 import tempfile
 import threading
@@ -20,9 +21,10 @@ import urllib.request
 
 import pytest
 
-from plugins.platforms.a2a import protocol, runtime_policy, security, tools
+from plugins.platforms.a2a import control_plane, protocol, runtime_policy, security, tools
 from plugins.platforms.a2a.control_plane import (
     ContextAccessDenied,
+    InvalidTaskState,
     PayloadConflict,
     TaskAccessDenied,
     TaskStore,
@@ -68,7 +70,7 @@ class TestBindSafety:
     def test_loopback_host_allowed_without_token(self, monkeypatch):
         monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
         monkeypatch.setenv("A2A_HOST", "localhost")
-        assert security.resolve_bind_host() == "localhost"
+        assert security.resolve_bind_host() == "127.0.0.1"
 
     def test_trusted_peer_credentials_allow_explicit_remote_bind(self, monkeypatch):
         monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
@@ -108,7 +110,7 @@ class TestBearerAuth:
             "on_behalf_of": ["brett"],
             "capabilities": ["brain.read"],
         }}}
-        identity = security.authenticate_bearer("Bearer peer-secret", extra)
+        identity = security.authenticate_bearer("Bearer peer-secret", extra, "legacy-spark-primary")
         assert identity is not None
         assert identity.principal == "spark-primary"
         assert security.authorize_claims(identity, "brett", "brain.read") is None
@@ -120,11 +122,11 @@ class TestBearerAuth:
             "on_behalf_of": ["brett"],
             "capabilities": ["brain.read"],
         }}}
-        identity = security.authenticate_bearer("Bearer peer-secret", extra)
+        identity = security.authenticate_bearer("Bearer peer-secret", extra, "legacy-spark-primary")
         assert identity is not None
         assert security.authorize_claims(identity, "mallory", "brain.read")
         assert security.authorize_claims(identity, "brett", "mail.send")
-        assert security.authenticate_bearer("Bearer wrong", extra) is None
+        assert security.authenticate_bearer("Bearer wrong", extra, "legacy-spark-primary") is None
 
     def test_two_key_overlap_hot_reload_and_key_lifecycle(self, monkeypatch):
         monkeypatch.setenv("A2A_PEER_KEY_A", "old-key")
@@ -153,12 +155,35 @@ class TestBearerAuth:
         assert security.authenticate_bearer("Bearer rotated-key", extra, "key-a") is None
         assert security.authenticate_bearer("Bearer new-key", extra, "key-b") is None
 
-    def test_legacy_bearer_has_no_remote_wildcard_grant(self, monkeypatch):
+    def test_legacy_bearer_is_usable_only_from_verified_loopback(self, monkeypatch):
         monkeypatch.setenv("A2A_BEARER_TOKEN", "legacy-secret")
-        identity = security.authenticate_bearer("Bearer legacy-secret", {})
+        assert security.authenticate_bearer("Bearer legacy-secret", {}) is None
+        identity = security.authenticate_bearer(
+            "Bearer legacy-secret", {}, local_request=True
+        )
         assert identity is not None
-        assert identity.legacy is True and identity.local is False
-        assert security.authorize_claims(identity, "brett", "system.proof")
+        assert identity.legacy is True and identity.local is True
+        assert security.authorize_claims(identity, "brett", "system.proof") is None
+
+    def test_key_id_and_token_conflicts_are_computed_before_filtering(self, monkeypatch):
+        monkeypatch.setenv("TOKEN_A", "shared")
+        monkeypatch.setenv("TOKEN_B", "other")
+        monkeypatch.setenv("TOKEN_C", "shared")
+        extra = {"trusted_peers": {
+            "peer-a": {"credentials": [{"key_id": "duplicate", "token_env": "TOKEN_A"}]},
+            "peer-b": {"credentials": [{"key_id": "duplicate", "token_env": "TOKEN_B"}]},
+            "peer-c": {"credentials": [{"key_id": "unique", "token_env": "TOKEN_C"}]},
+        }}
+        assert security.configured_trusted_peers(extra) == []
+        assert security.authenticate_bearer("Bearer shared", extra, "unique") is None
+
+    @pytest.mark.parametrize("expires", [float("nan"), float("inf"), "nan", "inf"])
+    def test_non_finite_key_expiry_fails_closed(self, monkeypatch, expires):
+        monkeypatch.setenv("TOKEN_EXPIRY", "secret")
+        extra = {"trusted_peers": {"peer": {"credentials": [{
+            "key_id": "key", "token_env": "TOKEN_EXPIRY", "expires_at": expires,
+        }]}}}
+        assert security.configured_trusted_peers(extra) == []
 
 
 class TestInjectionFilter:
@@ -238,6 +263,17 @@ class TestAudit:
         assert rec["request_id"] == "message-1"
         assert rec["status"] == "working"
 
+    def test_retry_with_same_outbox_event_id_is_sink_idempotent(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        for _ in range(2):
+            assert security.audit(
+                "terminal", "peer", "task", "", status="completed",
+                event_id="task:terminal:completed",
+            ) is True
+        records = tmp_path.joinpath("a2a_audit.jsonl").read_text().splitlines()
+        assert len(records) == 1
+        assert json.loads(records[0])["event_id"] == "task:terminal:completed"
+
 
 # --------------------------------------------------------------------------
 # Protocol
@@ -250,7 +286,7 @@ class TestAgentCard:
             description="test", skills=[], streaming=False, auth_required=False,
         )
         assert card["name"] == "hermes-test"
-        assert card["protocolVersion"] == "1.0"
+        assert card["protocolVersion"] == "0.3"
         assert card["capabilities"]["streaming"] is False
         assert "security" not in card
 
@@ -322,16 +358,19 @@ class TestDurableControlPlane:
 
     @staticmethod
     def _claim(store, *, principal="peer-a", obo="brett", request="msg-1",
-               context="ctx-owned", payload=None):
+               context="ctx-owned", payload=None, capability="system.proof",
+               owner="instance-a", lease_seconds=60, deadline=None):
         return store.claim_request(
             principal=principal,
             on_behalf_of=obo,
-            capability="system.proof",
+            capability=capability,
             request_key=request,
             payload_sha256=canonical_payload_sha256(payload or {"message": request}),
             requested_context_id=context,
             task_id=protocol.new_task_id(),
-            deadline_at=None,
+            deadline_at=deadline,
+            lease_owner=owner,
+            lease_seconds=lease_seconds,
         )
 
     def test_context_and_task_are_bound_to_principal_and_obo(self, monkeypatch, tmp_path):
@@ -345,6 +384,8 @@ class TestDurableControlPlane:
             self._claim(store, principal="peer-b", request="msg-2")
         with pytest.raises(ContextAccessDenied):
             self._claim(store, obo="mallory", request="msg-3")
+        with pytest.raises(ContextAccessDenied):
+            self._claim(store, capability="system.write", request="msg-4")
         with pytest.raises(TaskAccessDenied):
             store.get_task(task["task_id"], principal="peer-b", on_behalf_of="brett",
                            capability="system.proof")
@@ -364,8 +405,14 @@ class TestDurableControlPlane:
         with pytest.raises(PayloadConflict):
             self._claim(store, payload={"message": "changed"})
 
-        terminal, emitted = store.terminalize(task["task_id"], protocol.STATE_COMPLETED, "first")
-        suppressed, emitted_again = store.terminalize(task["task_id"], protocol.STATE_COMPLETED, "second")
+        terminal, emitted = store.terminalize(
+            task["task_id"], protocol.STATE_COMPLETED, "first",
+            lease_owner="instance-a", incarnation=task["incarnation"],
+        )
+        suppressed, emitted_again = store.terminalize(
+            task["task_id"], protocol.STATE_COMPLETED, "second",
+            lease_owner="instance-a", incarnation=task["incarnation"],
+        )
         assert emitted is True
         assert emitted_again is False
         assert terminal["result_text"] == suppressed["result_text"] == "first"
@@ -401,10 +448,220 @@ class TestDurableControlPlane:
         store = TaskStore()
         task, _ = self._claim(store)
         recovered = TaskStore().reconcile_after_restart()
-        assert [entry["task_id"] for entry in recovered] == [task["task_id"]]
+        assert recovered == []
         restored = store.get_task(task["task_id"], enforce_capability=False)
-        assert restored["state"] == protocol.STATE_FAILED
-        assert "not resumed" in restored["result_text"]
+        assert restored["state"] == protocol.STATE_WORKING
+        assert restored["lease_owner"] == "instance-a"
+
+    def test_full_logical_envelope_conflicts_on_context_or_deadline_change(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        store = TaskStore()
+        self._claim(store, request="envelope-1", context="ctx-one", payload={
+            "message": {"messageId": "envelope-1", "contextId": "ctx-one"},
+            "deadline": 123.0,
+        })
+        with pytest.raises(PayloadConflict):
+            self._claim(store, request="envelope-1", context="ctx-two", payload={
+                "message": {"messageId": "envelope-1", "contextId": "ctx-two"},
+                "deadline": 123.0,
+            })
+        with pytest.raises(PayloadConflict):
+            self._claim(store, request="envelope-1", context="ctx-one", payload={
+                "message": {"messageId": "envelope-1", "contextId": "ctx-one"},
+                "deadline": 456.0,
+            })
+
+    def test_two_live_instances_preserve_one_lease_and_do_not_replay(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        first = TaskStore()
+        task, created = first.claim_request(
+            principal="peer", on_behalf_of="brett", capability="proof", request_key="race-1",
+            payload_sha256=canonical_payload_sha256({"message": "once"}),
+            requested_context_id="ctx-race", task_id=protocol.new_task_id(), deadline_at=None,
+            lease_owner="instance-a", lease_seconds=60,
+        )
+        duplicate, created_again = TaskStore().claim_request(
+            principal="peer", on_behalf_of="brett", capability="proof", request_key="race-1",
+            payload_sha256=canonical_payload_sha256({"message": "once"}),
+            requested_context_id="ctx-race", task_id=protocol.new_task_id(), deadline_at=None,
+            lease_owner="instance-b", lease_seconds=60,
+        )
+        assert created is True and created_again is False
+        assert duplicate["task_id"] == task["task_id"]
+        assert duplicate["lease_owner"] == "instance-a"
+        assert TaskStore().reconcile_after_restart() == []
+
+    def test_cancel_is_requested_until_stop_is_confirmed(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        store = TaskStore()
+        task, _ = self._claim(store, request="cancel-confirm")
+        requested, changed = store.request_cancel(
+            task["task_id"], principal="peer-a", on_behalf_of="brett",
+            capability="system.proof", backstop="gateway.cancel_session_processing",
+        )
+        assert changed is True
+        assert requested["state"] == protocol.STATE_WORKING
+        assert requested["cancel_requested_at"] is not None
+        assert store.terminal_event_count(task["task_id"]) == 0
+        with pytest.raises(InvalidTaskState, match="stop request"):
+            store.terminalize(
+                task["task_id"], protocol.STATE_COMPLETED, "late success",
+                lease_owner="instance-a", incarnation=task["incarnation"],
+            )
+        terminal, emitted = store.confirm_execution_stopped(
+            task["task_id"], terminal_state=protocol.STATE_CANCELED, result_text="stopped",
+            lease_owner="instance-a", incarnation=task["incarnation"],
+        )
+        assert emitted is True and terminal["state"] == protocol.STATE_CANCELED
+        assert store.terminal_event_count(task["task_id"]) == 1
+
+    def test_context_has_one_cross_process_unfinished_execution(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._claim(TaskStore(), request="first", context="ctx-serialized")
+        with pytest.raises(InvalidTaskState, match="unfinished"):
+            self._claim(
+                TaskStore(), request="second", context="ctx-serialized", owner="instance-b"
+            )
+
+    def test_expired_dispatched_lease_is_uncertain_and_stale_owner_is_fenced(
+        self, monkeypatch, tmp_path,
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        store = TaskStore()
+        task, _ = self._claim(store, request="expired", lease_seconds=30)
+        task, dispatched = store.mark_dispatched(
+            task["task_id"], owner="instance-a", incarnation=task["incarnation"],
+            lease_seconds=30,
+        )
+        assert dispatched is True
+        conn = store._connect()
+        try:
+            conn.execute(
+                "UPDATE tasks SET lease_expires_at = ? WHERE task_id = ?",
+                (time.time() - 1, task["task_id"]),
+            )
+        finally:
+            conn.close()
+
+        recovered = TaskStore().reconcile_after_restart(exclude_owner="instance-b")
+        assert [entry["task_id"] for entry in recovered] == [task["task_id"]]
+        assert recovered[0]["execution_uncertain_at"] is not None
+        assert recovered[0]["cancel_requested_at"] is None
+        with pytest.raises(InvalidTaskState, match="lease"):
+            store.terminalize(
+                task["task_id"], protocol.STATE_COMPLETED, "stale completion",
+                lease_owner="instance-a", incarnation=task["incarnation"],
+            )
+
+    def test_outbox_claim_retry_and_terminal_pending_delivered_state(
+        self, monkeypatch, tmp_path,
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        store = TaskStore()
+        task, _ = self._claim(store, request="outbox")
+        first_claim = store.claim_audit_events(owner="flusher-a", task_id=task["task_id"])
+        assert len(first_claim) == 1 and first_claim[0]["attempts"] == 1
+        assert store.claim_audit_events(
+            owner="flusher-a", task_id=task["task_id"]
+        ) == []
+        assert TaskStore().claim_audit_events(
+            owner="flusher-b", task_id=task["task_id"]
+        ) == []
+        store.release_audit_claim(first_claim[0]["event_id"], owner="flusher-a")
+        retry = TaskStore().claim_audit_events(
+            owner="flusher-b", task_id=task["task_id"]
+        )
+        assert len(retry) == 1 and retry[0]["attempts"] == 2
+        assert store.mark_audit_delivered(
+            retry[0]["event_id"], owner="flusher-b"
+        ) is True
+
+        terminal, emitted = store.terminalize(
+            task["task_id"], protocol.STATE_COMPLETED, "done",
+            lease_owner="instance-a", incarnation=task["incarnation"],
+        )
+        assert emitted is True
+        assert store.terminal_delivery_state(task["task_id"]) == "pending"
+        terminal_claim = TaskStore().claim_audit_events(
+            owner="flusher-c", task_id=task["task_id"]
+        )
+        assert [event["direction"] for event in terminal_claim] == ["terminal"]
+        assert store.mark_audit_delivered(
+            terminal_claim[0]["event_id"], owner="flusher-c"
+        ) is True
+        assert terminal["state"] == protocol.STATE_COMPLETED
+        assert store.terminal_delivery_state(task["task_id"]) == "delivered"
+
+    def test_profile_context_override_selects_state_path(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "wrong-profile"))
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        profile_home = tmp_path / "profile-scoped"
+        token = set_hermes_home_override(profile_home)
+        try:
+            assert str(TaskStore().path).startswith(str(profile_home))
+        finally:
+            reset_hermes_home_override(token)
+
+    def test_wave2_database_schema_upgrades_in_place(self, tmp_path):
+        path = tmp_path / "tasks.sqlite3"
+        conn = sqlite3.connect(path)
+        conn.executescript("""
+            CREATE TABLE contexts (
+                context_id TEXT PRIMARY KEY, principal TEXT NOT NULL,
+                on_behalf_of TEXT NOT NULL, created_at REAL NOT NULL
+            );
+            CREATE TABLE tasks (
+                task_id TEXT PRIMARY KEY,
+                context_id TEXT NOT NULL REFERENCES contexts(context_id),
+                principal TEXT NOT NULL, on_behalf_of TEXT NOT NULL,
+                capability TEXT NOT NULL, request_key TEXT NOT NULL,
+                payload_sha256 TEXT NOT NULL, state TEXT NOT NULL,
+                result_text TEXT NOT NULL DEFAULT '', deadline_at REAL,
+                cancel_requested_at REAL,
+                cancellation_backstop TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL, updated_at REAL NOT NULL
+            );
+            INSERT INTO contexts(context_id, principal, on_behalf_of, created_at)
+                VALUES ('ctx-legacy', 'peer', 'brett', 1);
+            INSERT INTO tasks(
+                task_id, context_id, principal, on_behalf_of, capability,
+                request_key, payload_sha256, state, result_text, deadline_at,
+                cancel_requested_at, cancellation_backstop, created_at, updated_at
+            ) VALUES (
+                'task-legacy', 'ctx-legacy', 'peer', 'brett', 'proof',
+                'request-legacy', 'hash', 'working', '', NULL,
+                NULL, '', 1, 2
+            );
+        """)
+        conn.close()
+
+        store = TaskStore(path)
+        upgraded = store._connect()
+        try:
+            context_columns = {
+                row[1] for row in upgraded.execute("PRAGMA table_info(contexts)")
+            }
+            task_columns = {
+                row[1] for row in upgraded.execute("PRAGMA table_info(tasks)")
+            }
+            outbox_columns = {
+                row[1] for row in upgraded.execute("PRAGMA table_info(audit_outbox)")
+            }
+        finally:
+            upgraded.close()
+        assert "capability" in context_columns
+        assert {"dispatched_at", "lease_owner", "execution_uncertain_at"} <= task_columns
+        assert {"delivery_owner", "delivery_expires_at", "delivered_at"} <= outbox_columns
+        legacy = store.get_task("task-legacy", enforce_capability=False)
+        assert legacy["dispatched_at"] == 2
+        assert legacy["execution_uncertain_at"] is not None
+        assert legacy["stop_reason"] == "legacy-unleased"
+
+    def test_secondary_multiplex_a2a_is_explicitly_gated(self):
+        from gateway.run import _PORT_BINDING_PLATFORM_VALUES
+
+        assert "a2a" in _PORT_BINDING_PLATFORM_VALUES
 
 
 # --------------------------------------------------------------------------
@@ -499,13 +756,17 @@ class TestClientTools:
         # Outbound redaction applied before sending.
         sent = captured["body"]["params"]["message"]["parts"][0]["text"]
         assert "sk-abcdefghij" not in sent
+        assert captured["body"]["params"]["deadline"] > time.time()
 
     def test_call_reads_secret_from_key_env_and_sends_provenance(self, monkeypatch):
         monkeypatch.setenv("WORKER_A2A_TOKEN", "dedicated-secret")
         monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {
             "worker": {
                 "url": "http://hms-m1:9900",
-                "auth": {"type": "bearer", "key_env": "WORKER_A2A_TOKEN"},
+                "auth": {
+                    "type": "bearer", "key_env": "WORKER_A2A_TOKEN",
+                    "key_id": "worker-current",
+                },
                 "on_behalf_of": "brett",
                 "capability": "system.proof",
             }
@@ -523,8 +784,78 @@ class TestClientTools:
         monkeypatch.setattr(tools, "_http_post_json", fake_post)
         assert "ok" in tools.a2a_call({"agent": "worker", "message": "prove it"})
         assert captured["headers"]["Authorization"] == "Bearer dedicated-secret"
+        assert captured["headers"]["X-A2A-Key-Id"] == "worker-current"
         metadata = captured["body"]["params"]["message"]["metadata"]
         assert metadata == {"on_behalf_of": "brett", "capability": "system.proof"}
+
+    def test_outbound_audit_failure_prevents_network_dispatch(self, monkeypatch):
+        monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {
+            "worker": {"url": "http://127.0.0.1:9900"},
+        }})
+        monkeypatch.setattr(tools, "_http_get_json", lambda *args: None)
+        posted = []
+        monkeypatch.setattr(tools, "_http_post_json", lambda *args: posted.append(args))
+        monkeypatch.setattr(security, "audit", lambda *args, **kwargs: False)
+        out = tools.a2a_call({"agent": "worker", "message": "do not send"})
+        assert "audit persistence is unavailable" in out
+        assert posted == []
+
+    def test_dns_validation_connects_the_exact_validated_sockaddr(self, monkeypatch):
+        resolved = ("93.184.216.34", 80)
+        resolution_calls = []
+        connected = []
+        response = bytearray(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+
+        def fake_getaddrinfo(host, port, type):
+            resolution_calls.append((host, port, type))
+            return [(2, 1, 6, "", resolved)]
+
+        class FakeSocket:
+            def settimeout(self, _timeout):
+                pass
+
+            def connect(self, sockaddr):
+                connected.append(sockaddr)
+
+            def sendall(self, _payload):
+                pass
+
+            def recv_into(self, buffer):
+                if not response:
+                    return 0
+                count = min(len(buffer), len(response))
+                buffer[:count] = response[:count]
+                del response[:count]
+                return count
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(tools, "_load_config", lambda: {})
+        monkeypatch.setattr(tools.socket, "getaddrinfo", fake_getaddrinfo)
+        monkeypatch.setattr(tools.socket, "socket", lambda *_args, **_kwargs: FakeSocket())
+        assert tools._pinned_json_request(
+            "GET", "http://peer.example/", {}, 2
+        ) == {}
+        assert len(resolution_calls) == 1
+        assert connected == [resolved]
+
+    def test_mixed_public_private_dns_answer_never_connects(self, monkeypatch):
+        connected = []
+        monkeypatch.setattr(tools, "_load_config", lambda: {})
+        monkeypatch.setattr(tools.socket, "getaddrinfo", lambda *args, **kwargs: [
+            (2, 1, 6, "", ("93.184.216.34", 80)),
+            (2, 1, 6, "", ("127.0.0.1", 80)),
+        ])
+
+        class NeverSocket:
+            def connect(self, sockaddr):
+                connected.append(sockaddr)
+
+        monkeypatch.setattr(tools.socket, "socket", lambda *_args, **_kwargs: NeverSocket())
+        with pytest.raises(ValueError, match="private"):
+            tools._pinned_json_request("GET", "http://peer.example/", {}, 2)
+        assert connected == []
 
     def test_list_no_peers(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -724,7 +1055,7 @@ class TestRequestPolicy:
             "capability_tools": {"system.proof": ["terminal"]},
         })
         adapter = A2AAdapter(cfg)
-        identity = security.authenticate_bearer("Bearer secret", adapter.extra)
+        identity = security.authenticate_bearer("Bearer secret", adapter.extra, "legacy-spark-primary")
         params = {
             "peer": "attacker-chosen-name",
             "message": {
@@ -750,7 +1081,7 @@ class TestRequestPolicy:
             }
         }})
         adapter = A2AAdapter(cfg)
-        identity = security.authenticate_bearer("Bearer secret", adapter.extra)
+        identity = security.authenticate_bearer("Bearer secret", adapter.extra, "legacy-spark-primary")
         params = {"message": {
             **protocol.text_message("user", "hello"),
             "metadata": {"on_behalf_of": "brett", "capability": "system.proof"},
@@ -799,7 +1130,13 @@ class TestTaskTerminalControls:
             principal="localhost", on_behalf_of="", capability="", request_key="cancel-msg",
             payload_sha256=canonical_payload_sha256({"message": "cancel"}),
             requested_context_id="ctx-cancel", task_id=protocol.new_task_id(), deadline_at=None,
+            lease_owner=adapter._instance_id, lease_seconds=60,
         )
+        task, dispatched = adapter._tasks.mark_dispatched(
+            task["task_id"], owner=adapter._instance_id,
+            incarnation=task["incarnation"], lease_seconds=60,
+        )
+        assert dispatched is True
         fut = Future()
         with adapter._pending_lock:
             adapter._pending_replies["ctx-cancel"] = fut
@@ -811,12 +1148,195 @@ class TestTaskTerminalControls:
             backstop="gateway.cancel_session_processing",
         )
         assert emitted is True
-        adapter._interrupt_task(task["task_id"])
+        assert adapter._interrupt_task(task["task_id"]) is False
+        adapter._tasks.mark_execution_uncertain(
+            task["task_id"], reason="cancel-unconfirmed"
+        )
         asyncio.run(adapter.send("ctx-cancel", "late reply", metadata={"notify": True}))
         current = adapter._tasks.get_task(task["task_id"], enforce_capability=False)
-        assert canceled["state"] == current["state"] == protocol.STATE_CANCELED
+        assert canceled["state"] == current["state"] == protocol.STATE_WORKING
+        assert current["cancel_requested_at"] is not None
         assert current["result_text"] != "late reply"
+        assert adapter._tasks.terminal_event_count(task["task_id"]) == 0
+
+    def test_terminal_audit_failure_remains_pending_and_retries(self, monkeypatch, tmp_path):
+        adapter = self._adapter(monkeypatch, tmp_path)
+        task, _ = adapter._tasks.claim_request(
+            principal="localhost", on_behalf_of="", capability="", request_key="audit-retry",
+            payload_sha256=canonical_payload_sha256({"message": "audit"}),
+            requested_context_id="ctx-audit", task_id=protocol.new_task_id(), deadline_at=None,
+            lease_owner=adapter._instance_id, lease_seconds=60,
+        )
+        attempts = []
+        monkeypatch.setattr(
+            security, "audit", lambda *args, **kwargs: attempts.append(kwargs["event_id"]) or False,
+        )
+        assert adapter._flush_audit_outbox(task["task_id"]) is False
+        assert adapter._tasks.pending_audit_events(task["task_id"])[0]["attempts"] == 1
+        monkeypatch.setattr(security, "audit", lambda *args, **kwargs: True)
+        assert adapter._flush_audit_outbox(task["task_id"]) is True
+        delivered = adapter._tasks.claim_audit_events(
+            owner="other", task_id=task["task_id"]
+        )
+        assert delivered == []
+
+    def test_foreign_inflight_audit_claim_is_not_delivery_failure(
+        self, monkeypatch, tmp_path,
+    ):
+        adapter = self._adapter(monkeypatch, tmp_path)
+        task, _ = adapter._tasks.claim_request(
+            principal="localhost", on_behalf_of="", capability="",
+            request_key="audit-inflight",
+            payload_sha256=canonical_payload_sha256({"message": "audit"}),
+            requested_context_id="ctx-audit-inflight",
+            task_id=protocol.new_task_id(), deadline_at=None,
+            lease_owner=adapter._instance_id, lease_seconds=60,
+        )
+        foreign_claim = TaskStore(adapter._tasks.path).claim_audit_events(
+            owner="foreign-flusher", task_id=task["task_id"], lease_seconds=60,
+        )
+        assert len(foreign_claim) == 1
+        monkeypatch.setattr(
+            security, "audit",
+            lambda *args, **kwargs: pytest.fail("active foreign claim was stolen"),
+        )
+        assert adapter._flush_audit_outbox(task["task_id"]) is True
+        current = adapter._tasks.get_task(task["task_id"], enforce_capability=False)
+        assert current["state"] == protocol.STATE_WORKING
+
+    def test_owner_consumes_cross_instance_cancel_intent(self, monkeypatch, tmp_path):
+        adapter = self._adapter(monkeypatch, tmp_path)
+        adapter.lease_seconds = 0.75
+        adapter.reply_timeout = 5
+        adapter._message_handler = object()
+        loop = asyncio.new_event_loop()
+        loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
+        loop_thread.start()
+        adapter._loop = loop
+
+        async def blocked_agent(_event):
+            await asyncio.sleep(10)
+
+        adapter.handle_message = blocked_agent  # type: ignore
+        interrupted = []
+
+        def verified_interrupt(task_id):
+            interrupted.append(task_id)
+            dispatch = adapter._dispatch_futures.get(task_id)
+            if dispatch is not None:
+                dispatch.cancel()
+            return True
+
+        monkeypatch.setattr(adapter, "_interrupt_task", verified_interrupt)
+        result = {}
+        errors = []
+
+        def submit():
+            try:
+                params = {"message": protocol.text_message("user", "cancel me")}
+                result.update(adapter._handle_inbound_task(
+                    params, self._policy(), "rpc-cross-instance-cancel"
+                ))
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        submit_thread = threading.Thread(target=submit)
+        submit_thread.start()
+        task = None
+        try:
+            until = time.monotonic() + 2
+            while time.monotonic() < until:
+                conn = adapter._tasks._connect()
+                try:
+                    row = conn.execute(
+                        "SELECT * FROM tasks WHERE dispatched_at IS NOT NULL"
+                    ).fetchone()
+                finally:
+                    conn.close()
+                if row is not None:
+                    task = dict(row)
+                    break
+                time.sleep(0.01)
+            assert task is not None
+            TaskStore(adapter._tasks.path).request_cancel(
+                task["task_id"], principal="localhost", on_behalf_of="",
+                capability="", backstop="gateway.cancel_session_processing",
+            )
+            submit_thread.join(timeout=3)
+            assert submit_thread.is_alive() is False
+            assert errors == []
+            assert result["status"]["state"] == protocol.STATE_CANCELED
+            assert interrupted == [task["task_id"]]
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            loop_thread.join(timeout=2)
+            submit_thread.join(timeout=1)
+
+    def test_failed_cancel_is_retryable_until_stop_is_confirmed(self, monkeypatch, tmp_path):
+        adapter = self._adapter(monkeypatch, tmp_path)
+        task, _ = adapter._tasks.claim_request(
+            principal="localhost", on_behalf_of="", capability="", request_key="cancel-retry",
+            payload_sha256=canonical_payload_sha256({"message": "cancel"}),
+            requested_context_id="ctx-retry", task_id=protocol.new_task_id(), deadline_at=None,
+            lease_owner=adapter._instance_id, lease_seconds=60,
+        )
+        task, dispatched = adapter._tasks.mark_dispatched(
+            task["task_id"], owner=adapter._instance_id,
+            incarnation=task["incarnation"], lease_seconds=60,
+        )
+        assert dispatched is True
+        task, changed = adapter._tasks.request_cancel(
+            task["task_id"], principal="localhost", on_behalf_of="", capability="",
+            backstop="gateway.cancel_session_processing",
+        )
+        assert changed is True
+        outcomes = iter((False, True))
+        monkeypatch.setattr(adapter, "_interrupt_task", lambda _task_id: next(outcomes))
+        first = adapter._apply_cancellation(task)
+        assert first["state"] == protocol.STATE_WORKING
+        assert first["execution_uncertain_at"] is not None
+        repeated, changed_again = adapter._tasks.request_cancel(
+            task["task_id"], principal="localhost", on_behalf_of="", capability="",
+            backstop="gateway.cancel_session_processing",
+        )
+        assert changed_again is False
+        final = adapter._apply_cancellation(repeated)
+        assert final["state"] == protocol.STATE_CANCELED
         assert adapter._tasks.terminal_event_count(task["task_id"]) == 1
+
+    def test_noop_gateway_cancel_is_not_stop_confirmation(self, monkeypatch, tmp_path):
+        adapter = self._adapter(monkeypatch, tmp_path)
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+
+        class StillRunning:
+            def done(self):
+                return False
+
+        async def noop_cancel(_session_key):
+            return None
+
+        adapter._loop = loop
+        adapter._active_tasks["task-noop"] = "ctx-noop"
+        adapter._active_session_keys["task-noop"] = "session-noop"
+        adapter._session_tasks["session-noop"] = StillRunning()
+        monkeypatch.setattr(adapter, "cancel_session_processing", noop_cancel)
+        try:
+            assert adapter._interrupt_task("task-noop") is False
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2)
+
+    @pytest.mark.parametrize("deadline", [float("nan"), float("inf"), "nan", "-inf"])
+    def test_non_finite_request_deadline_is_rejected(self, monkeypatch, tmp_path, deadline):
+        adapter = self._adapter(monkeypatch, tmp_path)
+        params = {
+            "deadline": deadline,
+            "message": protocol.text_message("user", "bad deadline"),
+        }
+        with pytest.raises(ValueError, match="deadline"):
+            adapter._handle_inbound_task(params, self._policy(), "rpc-bad-deadline")
 
 
 @pytest.mark.integration
@@ -885,35 +1405,152 @@ class TestPrincipalBoundTaskHTTP:
             task = first["result"]
             task_id = task["id"]
             duplicate = await asyncio.to_thread(post, body, "token-a", "a-current")
-            assert duplicate["result"]["id"] == task_id
+            assert duplicate["result"] == task
             assert calls == [task_id]
 
             get_body = {"jsonrpc": "2.0", "id": "rpc-get", "method": "tasks/get",
                         "params": {"taskId": task_id, "metadata": metadata}}
             fetched = await asyncio.to_thread(post, get_body, "token-a", "a-current")
-            assert fetched["result"]["id"] == task_id
+            assert fetched["result"] == task
 
-            for forbidden in (
-                {"jsonrpc": "2.0", "id": "rpc-get-b", "method": "tasks/get",
-                 "params": {"taskId": task_id, "metadata": metadata}},
-                {"jsonrpc": "2.0", "id": "rpc-context-b", "method": "message/send",
-                 "params": {"message": {
-                     **protocol.text_message("user", "cross-principal context"),
-                     "contextId": "ctx-http-owned", "metadata": metadata,
-                 }}},
-            ):
+            hidden_errors = []
+            for hidden_task_id in (task_id, "task-does-not-exist"):
+                hidden = {
+                    "jsonrpc": "2.0", "id": "same-id", "method": "tasks/get",
+                    "params": {"taskId": hidden_task_id, "metadata": metadata},
+                }
                 with pytest.raises(urllib.error.HTTPError) as raised:
-                    await asyncio.to_thread(post, forbidden, "token-b", "b-current")
-                assert raised.value.code == 403
+                    await asyncio.to_thread(post, hidden, "token-b", "b-current")
+                hidden_errors.append((raised.value.code, json.loads(raised.value.read())))
+            assert hidden_errors[0] == hidden_errors[1]
+            assert hidden_errors[0][0] == 404
 
+            cancel_errors = []
+            for hidden_task_id in (task_id, "task-does-not-exist"):
+                hidden = {
+                    "jsonrpc": "2.0", "id": "same-id", "method": "tasks/cancel",
+                    "params": {"taskId": hidden_task_id, "metadata": metadata},
+                }
+                with pytest.raises(urllib.error.HTTPError) as raised:
+                    await asyncio.to_thread(post, hidden, "token-b", "b-current")
+                cancel_errors.append((raised.value.code, json.loads(raised.value.read())))
+            assert cancel_errors[0] == cancel_errors[1] == hidden_errors[0]
+
+            cross_context = {
+                "jsonrpc": "2.0", "id": "rpc-context-b", "method": "message/send",
+                "params": {"message": {
+                    **protocol.text_message("user", "cross-principal context"),
+                    "contextId": "ctx-http-owned", "metadata": metadata,
+                }},
+            }
+            with pytest.raises(urllib.error.HTTPError) as denied_context:
+                await asyncio.to_thread(post, cross_context, "token-b", "b-current")
+            assert denied_context.value.code == 403
+
+            changed_envelopes = []
             changed = json.loads(json.dumps(body))
             changed["params"]["message"]["parts"][0]["text"] = "changed payload"
-            with pytest.raises(urllib.error.HTTPError) as conflict:
-                await asyncio.to_thread(post, changed, "token-a", "a-current")
-            assert conflict.value.code == 409
+            changed_envelopes.append(changed)
+            for field, value in (
+                ("contextId", "ctx-other"),
+                ("deadline", time.time() + 60),
+                ("configuration", {"blocking": True}),
+            ):
+                changed = json.loads(json.dumps(body))
+                changed["params"][field] = value
+                changed_envelopes.append(changed)
+            for changed in changed_envelopes:
+                with pytest.raises(urllib.error.HTTPError) as conflict:
+                    await asyncio.to_thread(post, changed, "token-a", "a-current")
+                assert conflict.value.code == 409
+
+            stream = json.loads(json.dumps(body))
+            stream["id"] = "stream"
+            stream["method"] = "message/stream"
+            stream_result = await asyncio.to_thread(post, stream, "token-a", "a-current")
+            assert stream_result["error"]["code"] == -32601
             await adapter.disconnect()
 
         asyncio.run(run())
+
+    def test_multiplex_primary_http_threads_keep_profile_state_and_secrets(
+        self, monkeypatch, tmp_path,
+    ):
+        from agent.secret_scope import set_multiplex_active
+        from gateway.config import PlatformConfig
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        profile_home = tmp_path / "profile"
+        wrong_home = tmp_path / "wrong"
+        profile_home.mkdir()
+        profile_home.joinpath(".env").write_text(
+            "PROFILE_A2A_TOKEN=profile-secret\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(wrong_home))
+        monkeypatch.setenv("PROFILE_A2A_TOKEN", "wrong-global-secret")
+        set_multiplex_active(True)
+        home_token = set_hermes_home_override(profile_home)
+        try:
+            adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+                "host": "127.0.0.1",
+                "port": 0,
+                "trusted_peers": {"primary": {
+                    "credentials": [{
+                        "key_id": "profile-current", "token_env": "PROFILE_A2A_TOKEN",
+                    }],
+                    "on_behalf_of": ["brett"],
+                    "capabilities": ["system.proof"],
+                }},
+                "capability_tools": {"system.proof": []},
+            }))
+        finally:
+            reset_hermes_home_override(home_token)
+
+        async def fake_handle_message(event):
+            await adapter.send(event.source.chat_id, "profile scoped", metadata={"notify": True})
+
+        adapter.handle_message = fake_handle_message  # type: ignore
+        adapter._message_handler = object()
+        metadata = {"on_behalf_of": "brett", "capability": "system.proof"}
+
+        def post(token):
+            message = protocol.text_message("user", "profile request")
+            message["metadata"] = metadata
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{adapter.port}/",
+                data=json.dumps({
+                    "jsonrpc": "2.0", "id": "profile", "method": "message/send",
+                    "params": {"message": message},
+                }).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {token}",
+                    "X-A2A-Key-Id": "profile-current",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=5) as response:
+                return json.loads(response.read())
+
+        async def run():
+            try:
+                assert await adapter.connect() is True
+                with pytest.raises(urllib.error.HTTPError) as wrong:
+                    await asyncio.to_thread(post, "wrong-global-secret")
+                assert wrong.value.code == 401
+                response = await asyncio.to_thread(post, "profile-secret")
+                assert response["result"]["status"]["state"] == protocol.STATE_COMPLETED
+                assert str(adapter._tasks.path).startswith(str(profile_home))
+                assert profile_home.joinpath("a2a_audit.jsonl").exists()
+                assert not wrong_home.joinpath("a2a_audit.jsonl").exists()
+            finally:
+                await adapter.disconnect()
+
+        try:
+            asyncio.run(run())
+        finally:
+            set_multiplex_active(False)
 
     def test_http_rejects_wrong_content_type_and_oversized_body(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -948,6 +1585,51 @@ class TestPrincipalBoundTaskHTTP:
                 await asyncio.to_thread(raw_post, b"x" * 1025, "application/json")
             assert oversized.value.code == 413
             assert adapter._httpd.max_inflight_requests if hasattr(adapter._httpd, "max_inflight_requests") else True
+            await adapter.disconnect()
+
+        asyncio.run(run())
+
+    def test_absolute_request_deadline_releases_slowloris_slot(self, monkeypatch, tmp_path):
+        import socket
+        from gateway.config import PlatformConfig
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "host": "127.0.0.1", "port": 0,
+            "request_timeout": 1, "max_inflight_requests": 1,
+        }))
+
+        def trickle():
+            client = socket.create_connection(("127.0.0.1", adapter.port), timeout=2)
+            started = time.monotonic()
+            closed = False
+            try:
+                for byte in b"POST / HTTP/1.1\r\nContent-Length: 2\r\n":
+                    try:
+                        client.sendall(bytes([byte]))
+                    except OSError:
+                        closed = True
+                        break
+                    time.sleep(0.12)
+                if not closed:
+                    client.settimeout(0.5)
+                    closed = client.recv(1) == b""
+            except OSError:
+                closed = True
+            finally:
+                client.close()
+            return time.monotonic() - started, closed
+
+        async def run():
+            assert await adapter.connect() is True
+            elapsed, closed = await asyncio.to_thread(trickle)
+            assert closed is True
+            assert elapsed < 2.5
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{adapter.port}/health", timeout=2
+            ) as response:
+                assert response.status == 200
             await adapter.disconnect()
 
         asyncio.run(run())

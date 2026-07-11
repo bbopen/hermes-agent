@@ -23,10 +23,17 @@ JSON-RPC ``message/send`` method, so any A2A-compliant peer works.
 from __future__ import annotations
 
 import json
+import http.client
+import io
 import ipaddress
 import logging
+import math
 import os
+import queue
 import socket
+import ssl
+import threading
+import time
 import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
@@ -39,6 +46,157 @@ logger = logging.getLogger(__name__)
 _DEFAULT_TIMEOUT = 120
 _MAX_OUTBOUND_REQUEST_BYTES = 256 * 1024
 _MAX_OUTBOUND_RESPONSE_BYTES = 512 * 1024
+
+
+def _remaining(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("A2A request deadline exceeded")
+    return remaining
+
+
+def _resolve_addresses(host: str, port: int, deadline: float):
+    """Bound blocking getaddrinfo with a daemon resolver handoff."""
+    result: queue.Queue = queue.Queue(maxsize=1)
+
+    def resolve() -> None:
+        try:
+            result.put((True, socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)))
+        except Exception as exc:
+            result.put((False, exc))
+
+    threading.Thread(target=resolve, name="a2a-dns", daemon=True).start()
+    try:
+        ok, value = result.get(timeout=_remaining(deadline))
+    except queue.Empty as exc:
+        raise TimeoutError("peer DNS resolution exceeded request deadline") from exc
+    if not ok:
+        raise value
+    return value
+
+
+class _DeadlineRawReader(io.RawIOBase):
+    def __init__(self, sock, deadline: float) -> None:
+        super().__init__()
+        self._sock = sock
+        self._deadline = deadline
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        self._sock.settimeout(_remaining(self._deadline))
+        return self._sock.recv_into(buffer)
+
+
+class _DeadlineSocketView:
+    """HTTPResponse socket view that applies one absolute read deadline."""
+
+    def __init__(self, sock, deadline: float) -> None:
+        self._sock = sock
+        self._deadline = deadline
+
+    def makefile(self, mode="rb", buffering=None):
+        if mode != "rb":
+            raise ValueError("deadline socket view is read-only")
+        return io.BufferedReader(_DeadlineRawReader(self._sock, self._deadline))
+
+
+def _pinned_addresses(
+    url: str, deadline: Optional[float] = None,
+) -> tuple[object, tuple, str, int, str]:
+    """Resolve once, validate that address set, and return one connect target.
+
+    Validation and TCP connection deliberately share this resolution result so
+    a DNS rebinding response cannot turn a previously-safe hostname into an
+    internal connection between checking and use.
+    """
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    scheme = parts.scheme
+    port = parts.port or (443 if scheme == "https" else 80)
+    deadline = deadline or (time.monotonic() + _DEFAULT_TIMEOUT)
+    allow_private = _configured_origin_allowed(url, _load_config())
+    try:
+        parsed = ipaddress.ip_address(host)
+        addresses = [(
+            socket.AF_INET6 if parsed.version == 6 else socket.AF_INET,
+            (str(parsed), port, 0, 0) if parsed.version == 6 else (str(parsed), port),
+        )]
+    except ValueError:
+        try:
+            infos = _resolve_addresses(host, port, deadline)
+        except OSError as exc:
+            raise ValueError(f"peer host could not be resolved safely: {host}") from exc
+        addresses = [(family, sockaddr) for family, _, _, _, sockaddr in infos]
+    if not addresses:
+        raise ValueError(f"peer host could not be resolved safely: {host}")
+    parsed_addresses = [
+        ipaddress.ip_address(str(address[1][0]).split("%", 1)[0])
+        for address in addresses
+    ]
+    if any(not address.is_global for address in parsed_addresses) and not allow_private:
+        raise ValueError("private, loopback, link-local, or internal peer URLs require explicit configuration")
+    family, sockaddr = addresses[0]
+    path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+    return family, sockaddr, host, port, path
+
+
+def _pinned_json_request(
+    method: str,
+    url: str,
+    headers: dict,
+    timeout: float,
+    data: bytes = b"",
+) -> dict:
+    """Perform a bounded HTTP request through the validated resolved socket."""
+    timeout = float(timeout)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("peer timeout must be a positive finite number")
+    deadline = time.monotonic() + timeout
+    family, sockaddr, host, port, path = _pinned_addresses(url, deadline)
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(_remaining(deadline))
+        sock.connect(sockaddr)
+        if urlsplit(url).scheme == "https":
+            context = ssl.create_default_context()
+            sock = context.wrap_socket(sock, server_hostname=host)
+            sock.settimeout(_remaining(deadline))
+        display_host = f"[{host}]" if ":" in host else host
+        request_headers = {
+            "Host": display_host if port in (80, 443) else f"{display_host}:{port}",
+            "Connection": "close",
+            **headers,
+        }
+        if data:
+            request_headers.setdefault("Content-Length", str(len(data)))
+        for name, value in request_headers.items():
+            if not name or any(char in str(name) for char in "\r\n:"):
+                raise ValueError("invalid outbound HTTP header name")
+            if any(char in str(value) for char in "\r\n"):
+                raise ValueError("invalid outbound HTTP header value")
+        lines = [f"{method} {path} HTTP/1.1"]
+        lines.extend(f"{name}: {value}" for name, value in request_headers.items())
+        sock.settimeout(_remaining(deadline))
+        sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii") + data)
+        response = http.client.HTTPResponse(_DeadlineSocketView(sock, deadline))
+        response.begin()
+        if 300 <= response.status < 400:
+            raise urllib.error.HTTPError(url, response.status, "A2A redirects are rejected", response.headers, response)
+        if response.status >= 400:
+            raise urllib.error.HTTPError(url, response.status, response.reason, response.headers, response)
+        raw = response.read(_MAX_OUTBOUND_RESPONSE_BYTES + 1)
+        if len(raw) > _MAX_OUTBOUND_RESPONSE_BYTES:
+            raise ValueError("peer response is too large")
+        return json.loads(raw.decode("utf-8"))
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -64,7 +222,11 @@ def _origin(url: str) -> str:
 
 
 def _is_non_public_host(host: str) -> bool:
-    """Conservatively classify local, metadata, and internal destinations."""
+    """Classify syntactically local destinations without resolving DNS.
+
+    Hostname resolution is deliberately deferred to _pinned_addresses, where
+    the validated result is the exact sockaddr used by connect().
+    """
     lowered = host.lower().rstrip(".")
     if lowered in {"localhost", "localhost.localdomain"} or lowered.endswith(
         (".localhost", ".local", ".internal")
@@ -73,16 +235,7 @@ def _is_non_public_host(host: str) -> bool:
     try:
         return not ipaddress.ip_address(lowered).is_global
     except ValueError:
-        pass
-    try:
-        addresses = {
-            item[4][0] for item in socket.getaddrinfo(lowered, None, type=socket.SOCK_STREAM)
-        }
-    except OSError as exc:
-        raise ValueError(f"peer host could not be resolved safely: {lowered}") from exc
-    if not addresses:
-        raise ValueError(f"peer host could not be resolved safely: {lowered}")
-    return any(not ipaddress.ip_address(address).is_global for address in addresses)
+        return False
 
 
 def _validate_peer_url(
@@ -142,10 +295,16 @@ def _resolve_peer(agent: str) -> Optional[dict]:
     entry = peers.get(agent)
     if not entry:
         return None
+    try:
+        timeout = float(entry.get("timeout", _DEFAULT_TIMEOUT))
+    except (TypeError, ValueError):
+        timeout = float(_DEFAULT_TIMEOUT)
+    if not math.isfinite(timeout) or timeout <= 0:
+        timeout = float(_DEFAULT_TIMEOUT)
     return {
         "url": entry.get("url", ""),
         "auth": entry.get("auth", {}) or {},
-        "timeout": int(entry.get("timeout", _DEFAULT_TIMEOUT)),
+        "timeout": min(timeout, 3600.0),
         "on_behalf_of": str(entry.get("on_behalf_of") or ""),
         "capability": str(entry.get("capability") or ""),
         "configured": True,
@@ -155,7 +314,7 @@ def _resolve_peer(agent: str) -> Optional[dict]:
 def _auth_header(auth: dict) -> dict:
     if auth and auth.get("type") == "bearer":
         key_env = str(auth.get("key_env") or "").strip()
-        token = os.getenv(key_env, "").strip() if key_env else ""
+        token = security._credential_value(key_env) if key_env else ""
         # Legacy plaintext config remains readable for compatibility, but new
         # configurations must use key_env so secrets stay in the profile .env.
         token = token or str(auth.get("token") or "").strip()
@@ -172,28 +331,15 @@ def _auth_header(auth: dict) -> dict:
 # HTTP
 # --------------------------------------------------------------------------
 
-def _http_get_json(url: str, headers: dict, timeout: int) -> dict:
-    req = urllib.request.Request(url, headers=headers, method="GET")
-    opener = urllib.request.build_opener(_NoRedirect())
-    with opener.open(req, timeout=timeout) as resp:  # noqa: S310 (validated configured peers)
-        raw = resp.read(_MAX_OUTBOUND_RESPONSE_BYTES + 1)
-        if len(raw) > _MAX_OUTBOUND_RESPONSE_BYTES:
-            raise ValueError("peer response is too large")
-        return json.loads(raw.decode("utf-8"))
+def _http_get_json(url: str, headers: dict, timeout: float) -> dict:
+    return _pinned_json_request("GET", url, headers, timeout)
 
 
-def _http_post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
+def _http_post_json(url: str, body: dict, headers: dict, timeout: float) -> dict:
     data = json.dumps(body).encode("utf-8")
     if len(data) > _MAX_OUTBOUND_REQUEST_BYTES:
         raise ValueError("A2A request is too large")
-    hdrs = {"Content-Type": "application/json", **headers}
-    req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
-    opener = urllib.request.build_opener(_NoRedirect())
-    with opener.open(req, timeout=timeout) as resp:  # noqa: S310 (validated configured peers)
-        raw = resp.read(_MAX_OUTBOUND_RESPONSE_BYTES + 1)
-        if len(raw) > _MAX_OUTBOUND_RESPONSE_BYTES:
-            raise ValueError("peer response is too large")
-        return json.loads(raw.decode("utf-8"))
+    return _pinned_json_request("POST", url, {"Content-Type": "application/json", **headers}, timeout, data)
 
 
 def _card_url(base_url: str) -> str:
@@ -297,14 +443,52 @@ def a2a_call(args: dict, **_: Any) -> str:
     except ValueError as e:
         return f"Error: unsafe peer URL — {e}."
     headers = _auth_header(peer["auth"])
-    timeout = peer["timeout"]
+    try:
+        timeout = float(peer["timeout"])
+    except (TypeError, ValueError):
+        return f"Error: peer '{agent}' has an invalid request timeout."
+    if not math.isfinite(timeout) or timeout <= 0:
+        return f"Error: peer '{agent}' has an invalid request timeout."
+    timeout = min(timeout, 3600.0)
+    request_deadline = time.monotonic() + timeout
     on_behalf_of = on_behalf_of or peer.get("on_behalf_of", "")
     capability = capability or peer.get("capability", "")
+
+    ctx = context_id or protocol.new_context_id()
+    safe_message = security.redact_outbound(message)
+    rpc_body = {
+        "jsonrpc": "2.0",
+        "id": protocol.new_task_id(),
+        "method": "message/send",
+        "params": {
+            "message": protocol.text_message("user", safe_message),
+            "deadline": time.time() + timeout,
+        },
+    }
+    rpc_body["params"]["message"]["metadata"] = {
+        "on_behalf_of": on_behalf_of,
+        "capability": capability,
+    }
+    if context_id:
+        rpc_body["params"]["message"]["contextId"] = context_id
+    if not security.audit(
+        "outbound",
+        agent,
+        rpc_body["id"],
+        safe_message,
+        on_behalf_of=on_behalf_of,
+        capability=capability,
+        request_id=rpc_body["params"]["message"]["messageId"],
+        status="submitted",
+    ):
+        return "Error: outbound audit persistence is unavailable; request was not sent."
 
     # Best-effort card fetch (to learn the rpc URL); non-fatal on failure.
     card = None
     try:
-        card = _http_get_json(_card_url(base_url), headers, min(timeout, 30))
+        card = _http_get_json(
+            _card_url(base_url), headers, min(_remaining(request_deadline), 30.0)
+        )
     except urllib.error.HTTPError as e:
         if 300 <= e.code < 400:
             return f"Error: peer '{agent}' redirected its Agent Card; redirects are refused."
@@ -323,28 +507,19 @@ def a2a_call(args: dict, **_: Any) -> str:
     except ValueError as e:
         return f"Error: peer '{agent}' Agent Card was rejected — {e}."
 
-    ctx = context_id or protocol.new_context_id()
-    safe_message = security.redact_outbound(message)
-    rpc_body = {
-        "jsonrpc": "2.0",
-        "id": protocol.new_task_id(),
-        "method": "message/send",
-        "params": {"message": protocol.text_message("user", safe_message)},
-    }
-    rpc_body["params"]["message"]["metadata"] = {
-        "on_behalf_of": on_behalf_of,
-        "capability": capability,
-    }
-    if context_id:
-        rpc_body["params"]["message"]["contextId"] = context_id
-
-    security.audit("outbound", agent, rpc_body["id"], safe_message)
+    try:
+        peer_remaining = _remaining(request_deadline)
+    except TimeoutError:
+        return f"Error: call to '{agent}' exceeded its request deadline."
+    rpc_body["params"]["deadline"] = time.time() + peer_remaining
     protocol.persist_message(ctx, "user", safe_message, rpc_body["id"])
 
     try:
         # The credential-bearing request is issued only after the final RPC
         # target has passed the exact configured-origin pin above.
-        resp = _http_post_json(rpc_url, rpc_body, headers, timeout)
+        resp = _http_post_json(
+            rpc_url, rpc_body, headers, _remaining(request_deadline)
+        )
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
             return f"Error: peer '{agent}' rejected auth (HTTP {e.code}). Check the configured token."
