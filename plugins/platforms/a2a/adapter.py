@@ -1304,6 +1304,8 @@ class A2AAdapter(BasePlatformAdapter):
                     )
                     return SendResult(success=True, message_id=None)
                 previous = self._stream_buffers.pop(chat_id, "")
+                previous = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", previous)
+                previous = re.sub(r"[▉█▌▋▍▎▏▐]+\s*$", "", previous)
                 incoming = security.redact_outbound(content or "")
                 content = incoming if incoming.startswith(previous) else previous + incoming
                 if task_id:
@@ -1324,6 +1326,10 @@ class A2AAdapter(BasePlatformAdapter):
                         logger.error("A2A: could not persist final reply for task %s", task_id,
                                      exc_info=True)
                         fut.set_exception(_TaskInterrupted("durable task completion failed"))
+                        return SendResult(
+                            success=False,
+                            error="A2A durable task completion failed",
+                        )
                     else:
                         if emitted:
                             self._flush_audit_outbox(task_id)

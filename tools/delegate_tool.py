@@ -2544,6 +2544,8 @@ def delegate_task(
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
 
+    _caller_context = contextvars.copy_context()
+
     def _execute_and_aggregate() -> dict:
         """Run all built children (1 or N), join on them, aggregate results,
         fire subagent_stop hooks + cost rollup, and return the combined result
@@ -2571,12 +2573,14 @@ def delegate_task(
             with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
                 futures = {}
                 for i, t, child in children:
+                    child_context = _caller_context.copy()
                     future = executor.submit(
+                        child_context.run,
                         _run_single_child,
-                        task_index=i,
-                        goal=t["goal"],
-                        child=child,
-                        parent_agent=parent_agent,
+                        i,
+                        t["goal"],
+                        child,
+                        parent_agent,
                     )
                     futures[future] = i
 

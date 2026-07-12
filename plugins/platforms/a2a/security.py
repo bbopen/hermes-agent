@@ -245,6 +245,21 @@ def validate_inbound_config(extra: Mapping[str, Any]) -> str:
                 return f"trusted_peers.{principal} must be a mapping"
             if "enabled" in raw and type(raw["enabled"]) is not bool:
                 return f"trusted_peers.{principal}.enabled must be a boolean"
+            credentials = raw.get("credentials")
+            if credentials is not None:
+                if not isinstance(credentials, list) or not credentials:
+                    return f"trusted_peers.{principal}.credentials must be a non-empty list"
+                allowed_fields = {"key_id", "id", "token_env", "expires_at", "revoked"}
+                for index, credential in enumerate(credentials):
+                    if not isinstance(credential, Mapping) or set(credential) - allowed_fields:
+                        return f"trusted_peers.{principal}.credentials[{index}] has invalid fields"
+                    for field in ("key_id", "id", "token_env"):
+                        if field in credential and (
+                            not isinstance(credential[field], str) or not credential[field].strip()
+                        ):
+                            return f"trusted_peers.{principal}.credentials[{index}].{field} must be a string"
+                    if "revoked" in credential and type(credential["revoked"]) is not bool:
+                        return f"trusted_peers.{principal}.credentials[{index}].revoked must be boolean"
             for field in ("on_behalf_of", "capabilities"):
                 values = raw.get(field)
                 if not isinstance(values, list) or not values or any(
@@ -308,7 +323,11 @@ def is_wildcard_host(value: Any) -> bool:
 
 def canonical_bind_host(value: Any) -> str:
     """Canonicalize numeric bind aliases before applying exposure policy."""
-    host = str(value or "").strip().strip("[]")
+    host = unicodedata.normalize("NFKC", str(value or "").strip()).strip("[]")
+    try:
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        return host
     if is_wildcard_host(host):
         return "::" if ":" in host else "0.0.0.0"
     try:
@@ -351,6 +370,8 @@ def validate_advertised_url(value: Any) -> str:
         ):
             raise ValueError
         port = parsed.port
+        if "%" in hostname:
+            raise ValueError
         decoded_host = unicodedata.normalize("NFKC", unquote(hostname))
         if any(char.isspace() for char in decoded_host):
             raise ValueError

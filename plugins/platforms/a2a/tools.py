@@ -148,6 +148,14 @@ def _pinned_addresses(
         ipaddress.ip_address(str(address[1][0]).split("%", 1)[0])
         for address in addresses
     ]
+    if any(
+        address.is_unspecified
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+        for address in parsed_addresses
+    ):
+        raise ValueError("unsafe peer address class is never permitted")
     if any(not address.is_global for address in parsed_addresses) and not allow_private:
         raise ValueError("private, loopback, link-local, or internal peer URLs require explicit configuration")
     family, sockaddr = addresses[0]
@@ -363,6 +371,35 @@ def _auth_header(auth: dict) -> dict:
                 headers["X-A2A-Key-Id"] = key_id
             return headers
     return {}
+
+
+def _jsonrpc_response_error(response: Any) -> str:
+    if not isinstance(response, dict) or response.get("jsonrpc") != "2.0":
+        return "response must be a JSON-RPC 2.0 object"
+    has_result = "result" in response
+    has_error = "error" in response
+    if has_result == has_error:
+        return "response must contain exactly one of result or error"
+    if has_error:
+        error = response["error"]
+        if not isinstance(error, dict):
+            return "error must be an object"
+        if type(error.get("code")) is not int or not isinstance(error.get("message"), str):
+            return "error code/message are invalid"
+        return ""
+    result = response["result"]
+    if not isinstance(result, dict):
+        return "result must be an object"
+    for field in ("id", "contextId"):
+        if field in result and not isinstance(result[field], str):
+            return f"result.{field} must be a string"
+    if "status" in result:
+        status = result["status"]
+        if not isinstance(status, dict) or not isinstance(status.get("state"), str):
+            return "result.status.state must be a string"
+    if "artifacts" in result and not isinstance(result["artifacts"], list):
+        return "result.artifacts must be a list"
+    return ""
 
 
 # --------------------------------------------------------------------------
@@ -588,8 +625,9 @@ def a2a_call(args: dict, **_: Any) -> str:
     except Exception as e:
         return f"Error: call to '{agent}' failed — {e}."
 
-    if not isinstance(resp, dict) or resp.get("jsonrpc") != "2.0":
-        return f"Error: peer '{agent}' returned an invalid JSON-RPC response."
+    response_error = _jsonrpc_response_error(resp)
+    if response_error:
+        return f"Error: peer '{agent}' returned an invalid JSON-RPC response — {response_error}."
     if resp.get("id") != rpc_body["id"]:
         return f"Error: peer '{agent}' returned a mismatched JSON-RPC response id."
 
@@ -633,11 +671,23 @@ def a2a_list(args: dict | None = None, **_: Any) -> str:
     cfg = _load_config()
     peers = cfg.get("a2a_agents") or {}
     lines = []
+    if not isinstance(peers, dict):
+        return "Error: invalid A2A peer configuration — a2a_agents must be a mapping."
     if peers:
         lines.append(f"Configured peers ({len(peers)}):")
-        for name, entry in peers.items():
-            auth = (entry.get("auth") or {}).get("type", "none")
-            lines.append(f"  - {name}: {entry.get('url', '?')} (auth: {auth})")
+        for name in peers:
+            if not isinstance(name, str):
+                return "Error: invalid A2A peer configuration — peer names must be strings."
+            entry = _resolve_peer(name)
+            if not entry or entry.get("error"):
+                reason = (entry or {}).get("error", "invalid peer")
+                return f"Error: invalid A2A peer configuration — {reason}."
+            auth = entry["auth"].get("type", "none")
+            lines.append(
+                f"  - {security.redact_public_text(name)}: "
+                f"{security.redact_public_text(str(entry['url']))} "
+                f"(auth: {security.redact_public_text(str(auth))})"
+            )
     else:
         lines.append("No peers configured. Add them under 'a2a_agents' in config.yaml.")
 
@@ -646,7 +696,7 @@ def a2a_list(args: dict | None = None, **_: Any) -> str:
         lines.append("")
         lines.append(f"Persisted conversations ({len(convos)}):")
         for c in convos[:25]:
-            lines.append(f"  - {c}")
+            lines.append(f"  - {security.redact_public_text(str(c))}")
     return "\n".join(lines)
 
 

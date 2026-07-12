@@ -109,6 +109,15 @@ class TestBindSafety:
 
 
 class TestBearerAuth:
+    def test_credential_schema_rejects_coercions_and_unknown_fields(self):
+        base = {"on_behalf_of": ["brett"], "capabilities": ["proof"]}
+        for credential in (
+            {"key_id": "key", "token_env": "TOKEN", "revoked": "false"},
+            {"key_id": "key", "token_env": "TOKEN", "surprise": True},
+        ):
+            assert security.validate_inbound_config({
+                "trusted_peers": {"peer": {**base, "credentials": [credential]}}
+            })
     @pytest.mark.parametrize("enabled", ["false", 0, 1, None])
     def test_trusted_peer_enabled_requires_literal_boolean(self, enabled):
         assert security.validate_inbound_config({"trusted_peers": {"peer": {
@@ -927,6 +936,21 @@ class TestDurableControlPlane:
 # --------------------------------------------------------------------------
 
 class TestClientTools:
+    def test_strict_response_schema_and_listing_errors(self, monkeypatch):
+        assert tools._jsonrpc_response_error({"jsonrpc": "2.0", "id": "x", "result": {}, "error": {}})
+        assert tools._jsonrpc_response_error({"jsonrpc": "2.0", "id": "x", "error": {"code": True, "message": "bad"}})
+        monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": ["peer"]})
+        assert tools.a2a_list().startswith("Error:")
+
+    def test_metadata_and_link_local_addresses_are_never_permitted(self, monkeypatch):
+        monkeypatch.setattr(tools, "_load_config", lambda: {
+            "a2a_agents": {"hms-m1": {"url": "http://hms-m1:9900"}}
+        })
+        monkeypatch.setattr(tools, "_resolve_addresses", lambda *args: [
+            (2, 1, 6, "", ("169.254.169.254", 9900)),
+        ])
+        with pytest.raises(ValueError, match="address class"):
+            tools._pinned_addresses("http://hms-m1:9900/")
     @pytest.mark.parametrize("peers", [["peer"], {"peer": "bad"}, {"peer": {"url": "http://x", "auth": []}}])
     def test_malformed_outbound_peer_config_is_controlled(self, monkeypatch, peers):
         monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": peers})
@@ -1208,6 +1232,20 @@ class TestRegistryDispatchConvention:
 # --------------------------------------------------------------------------
 
 class TestReplyCapture:
+    def test_stream_cursor_preview_plus_final_delta_is_exact(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        adapter = A2AAdapter(PlatformConfig(enabled=True))
+        future = Future()
+        adapter._pending_replies["ctx-cursor"] = future
+
+        async def run():
+            await adapter.send("ctx-cursor", "Hello ▉", metadata={"expect_edits": True})
+            await adapter.send("ctx-cursor", "world", metadata={"notify": True})
+
+        asyncio.run(run())
+        assert future.result(timeout=0) == "Hello world"
     def test_stream_preview_accumulates_and_commits_exact_final_once(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.a2a.adapter import A2AAdapter
@@ -1261,6 +1299,8 @@ class TestReplyCapture:
         assert asyncio.run(zero_advertised.connect()) is False
         for alias in ("0", "0.0.0.0", "::", "[::]", "::ffff:0.0.0.0"):
             assert security.is_wildcard_host(alias)
+        for alias in ("０", "⓪", "𝟢", "𝟘"):
+            assert security.canonical_bind_host(alias) == "0.0.0.0"
         for url in (
             "http://0:9900/",
             "http://0x0:9900/",
@@ -1268,6 +1308,8 @@ class TestReplyCapture:
         ):
             with pytest.raises(ValueError):
                 security.validate_advertised_url(url)
+        with pytest.raises(ValueError):
+            security.validate_advertised_url("http://%2530:9900/")
         for url in (
             "http://０:9900/", "http://⓪:9900/", "http://𝟢:9900/",
             "http://𝟘:9900/", "http://０.０.０.０:9900/",

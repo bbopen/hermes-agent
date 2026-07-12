@@ -73,6 +73,11 @@ When the `a2a` platform is enabled, Hermes serves an Agent Card at
 session — the same agent that's talking to you, with full memory — and the
 reply is returned over A2A.
 
+A2A is deliberately synchronous (`supports_async_delivery: false`): the HTTP
+task remains durable and queryable through `tasks/get`, including progress and
+its terminal completion, but Hermes does not promise a push after that request
+channel has closed. Callers must poll the durable task when they detach.
+
 ## Security
 
 - **Local mode is actually loopback-bound.** Without an active `trusted_peers`
