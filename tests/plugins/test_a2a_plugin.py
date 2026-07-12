@@ -334,6 +334,26 @@ class TestOutboundRedaction:
         text = "The answer is 42 and the build passed."
         assert security.redact_outbound(text) == text
 
+    def test_repeated_near_match_prefixes_are_single_pass_and_bounded(
+        self, monkeypatch,
+    ):
+        import agent.redact as core_redact
+
+        original = core_redact.redact_sensitive_text
+        calls = 0
+
+        def counted(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(core_redact, "redact_sensitive_text", counted)
+        text = "ghp_x" * 16_000
+        started = time.monotonic()
+        assert security.redact_outbound(text) == text
+        assert time.monotonic() - started < 1.0
+        assert calls == 1
+
 
 class TestAudit:
     def test_missing_posix_locking_fails_cleanly(self, monkeypatch, tmp_path):
@@ -1646,6 +1666,69 @@ class TestReplyCapture:
 
         asyncio.run(run())
 
+    @pytest.mark.parametrize("replace_after_cancel", [False, True])
+    def test_interrupt_removes_or_tombstones_orphaned_exact_queued_event(
+        self, monkeypatch, replace_after_cancel,
+    ):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import MessageEvent, MessageType
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        adapter = A2AAdapter(PlatformConfig(enabled=True))
+        task_id = "task-orphaned-queued-event"
+        context_id = "ctx-orphaned-queued-event"
+        session_key = "a2a:ctx-orphaned-queued-event"
+        event = MessageEvent(
+            text="must never execute", message_type=MessageType.TEXT,
+            source=adapter.build_source(
+                chat_id=context_id, chat_name="a2a:test", chat_type="dm",
+                user_id="peer", user_name="peer", role_authorized=True,
+            ),
+            message_id=task_id,
+        )
+
+        async def run():
+            adapter._loop = asyncio.get_running_loop()
+            dispatch = Future()
+            dispatch.set_result(None)
+            with adapter._pending_lock:
+                adapter._active_tasks[task_id] = context_id
+                adapter._active_session_keys[task_id] = session_key
+                adapter._dispatch_futures[task_id] = dispatch
+                adapter._dispatch_handoff_complete.add(task_id)
+                adapter._pending_messages[session_key] = event
+
+            if replace_after_cancel:
+                original_cancel = adapter.cancel_session_processing
+
+                async def cancel_then_replace(key):
+                    await original_cancel(key)
+                    adapter._pending_messages[key] = event
+
+                monkeypatch.setattr(
+                    adapter, "cancel_session_processing", cancel_then_replace,
+                )
+
+            assert await asyncio.to_thread(adapter._interrupt_task, task_id)
+            with adapter._pending_lock:
+                assert adapter._pending_messages.get(session_key) is None
+                assert task_id in adapter._queued_start_prevented
+                assert adapter._execution_stopped_locked(task_id)
+
+            # A stale drain that retained the event object is still fenced by
+            # the task tombstone and cannot enter the agent handler.
+            called = False
+
+            async def forbidden_handler(_event):
+                nonlocal called
+                called = True
+
+            adapter._message_handler = forbidden_handler
+            await adapter._process_message_background(event, session_key)
+            assert called is False
+
+        asyncio.run(run())
+
     def test_final_result_admission_uses_exact_wire_encoder_for_ascii_and_emoji(
         self, monkeypatch, tmp_path,
     ):
@@ -1882,6 +1965,34 @@ class TestReplyCapture:
         finally:
             with adapter._pending_lock:
                 adapter._pending_replies.pop("ctx-final", None)
+
+    def test_final_send_redacts_once_before_taking_state_lock(self, monkeypatch):
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = A2AAdapter(PlatformConfig(enabled=True))
+        fut = Future()
+        calls = 0
+
+        def redact(value):
+            nonlocal calls
+            calls += 1
+            assert not adapter._pending_lock.locked()
+            return f"safe:{value}"
+
+        monkeypatch.setattr(security, "redact_outbound", redact)
+        with adapter._pending_lock:
+            adapter._pending_replies["ctx-redact"] = fut
+
+        async def run():
+            result = await adapter.send(
+                "ctx-redact", "result", metadata={"notify": True},
+            )
+            assert result.success is True
+
+        asyncio.run(run())
+        assert fut.result(timeout=0) == "safe:result"
+        assert calls == 1
 
     def test_disconnect_fails_pending_reply(self):
         from plugins.platforms.a2a.adapter import A2AAdapter
@@ -2185,6 +2296,14 @@ class TestRequestPolicy:
         malformed = json.loads(json.dumps(valid))
         malformed["junk"] = 1
         assert adapter_module._params_schema_error("message/send", malformed)
+        for method, params in (
+            ("message/send", {"message": valid["message"], "metadata": None}),
+            ("message/send", {"message": valid["message"], "configuration": None}),
+            ("tasks/get", {"taskId": "task-safe", "metadata": None}),
+            ("tasks/getByRequest", {"requestId": "request-safe", "metadata": None}),
+            ("tasks/cancel", {"taskId": "task-safe", "metadata": None}),
+        ):
+            assert adapter_module._params_schema_error(method, params)
         with pytest.raises(ValueError):
             adapter_module._parse_json_int("9" * 4000)
         with pytest.raises(ValueError):
@@ -3182,6 +3301,16 @@ class TestInboundRoundTrip:
                 malformed_deadline["params"]["metadata"] = {"deadline": []}
                 assert await asyncio.to_thread(
                     raw_post, "/", malformed_deadline, valid_auth,
+                ) == 400
+                null_metadata = json.loads(json.dumps(valid))
+                null_metadata["params"]["metadata"] = None
+                assert await asyncio.to_thread(
+                    raw_post, "/", null_metadata, valid_auth,
+                ) == 400
+                null_configuration = json.loads(json.dumps(valid))
+                null_configuration["params"]["configuration"] = None
+                assert await asyncio.to_thread(
+                    raw_post, "/", null_configuration, valid_auth,
                 ) == 400
                 conflicting_deadline = json.loads(json.dumps(valid))
                 conflicting_deadline["params"]["deadline"] = time.time() + 60

@@ -638,7 +638,7 @@ def redact_outbound(text: str) -> str:
     # A2A is a mandatory disclosure boundary: user-level log redaction opt-out
     # must never permit credentials to cross it. Reuse the maintained core
     # corpus so new vendor formats are covered here automatically.
-    from agent.redact import _PREFIX_PATTERNS, _PREFIX_SUBSTRINGS, redact_sensitive_text
+    from agent.redact import _PREFIX_PATTERNS, redact_sensitive_text
 
     redacted = redact_sensitive_text(text, force=True)
     # The email pattern begins with a greedy local-part matcher; running it at
@@ -650,16 +650,10 @@ def redact_outbound(text: str) -> str:
         return redacted
     if any(re.search(pattern, text) for pattern in _PREFIX_PATTERNS):
         return "[redacted]"
-    # Core log redaction uses token boundaries for fidelity. A2A is a network
-    # disclosure boundary, so recognized vendor prefixes remain secret even
-    # when concatenated to attacker-controlled alphanumeric text.
-    for prefix in _PREFIX_SUBSTRINGS:
-        start = text.find(prefix)
-        while start >= 0:
-            probe = " " + text[start:]
-            if redact_sensitive_text(probe, force=True)[1:] != text[start:]:
-                return "[redacted]"
-            start = text.find(prefix, start + 1)
+    # The maintained patterns already search the entire value and cover
+    # concatenated credentials. Do not rescan every suffix after a near-match:
+    # adversarial repeated prefixes otherwise make this network-boundary
+    # redactor quadratic while the gateway event loop is serving requests.
     return text
 
 

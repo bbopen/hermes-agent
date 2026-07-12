@@ -227,9 +227,8 @@ def _message_schema_error(message: Any) -> str:
 def _params_schema_error(method: str, params: Any) -> str:
     if not isinstance(params, dict):
         return "params must be an object"
-    metadata = params.get("metadata")
-    if metadata is not None:
-        error = _metadata_schema_error(metadata)
+    if "metadata" in params:
+        error = _metadata_schema_error(params["metadata"])
         if error:
             return error
     if method == "message/send":
@@ -246,8 +245,8 @@ def _params_schema_error(method: str, params: Any) -> str:
             return "idempotencyKey must be a string"
         if "contextId" in params and not _safe_external_id(params["contextId"]):
             return "contextId must be a safe string"
-        configuration = params.get("configuration")
-        if configuration is not None:
+        if "configuration" in params:
+            configuration = params["configuration"]
             if not isinstance(configuration, dict) or set(configuration) - {
                 "blocking", "acceptedOutputModes", "historyLength",
             }:
@@ -505,6 +504,11 @@ class A2AAdapter(BasePlatformAdapter):
         with self._pending_lock:
             tracked = self._active_tasks.get(task_id) == event.source.chat_id
             if tracked:
+                if task_id in self._dispatch_stop_requested:
+                    # A cancellation tombstone wins even if Base transferred a
+                    # queued event to a new drain task after cancellation began.
+                    self._queued_start_prevented.add(task_id)
+                    return
                 self._event_execution_started.add(task_id)
                 if current is not None:
                     self._owned_session_tasks[task_id] = current
@@ -1017,9 +1021,21 @@ class A2AAdapter(BasePlatformAdapter):
                     dispatch.cancel()
                 if session_key:
                     await self.cancel_session_processing(session_key)
-                await asyncio.sleep(0)
                 with self._pending_lock:
-                    if task_id not in self._event_execution_started:
+                    queued_event = (
+                        self._pending_messages.get(session_key)
+                        if session_key else None
+                    )
+                    if (
+                        queued_event is not None
+                        and str(getattr(queued_event, "message_id", "") or "") == task_id
+                    ):
+                        self._pending_messages.pop(session_key, None)
+                        queued_event = None
+                    if (
+                        task_id not in self._event_execution_started
+                        and queued_event is None
+                    ):
                         self._queued_start_prevented.add(task_id)
                     execution_stopped = self._execution_stopped_locked(task_id)
                 current = self._tasks.get_task(task_id, enforce_capability=False) or current
@@ -1349,19 +1365,33 @@ class A2AAdapter(BasePlatformAdapter):
             if dispatch is not None and not dispatch.done():
                 dispatch.cancel()
                 await asyncio.sleep(0)
-            session_task = self._session_tasks.get(session_key) if session_key else None
             exact_owner = self._owned_session_tasks.get(task_id)
-            if session_task is not None and not session_task.done() and session_key:
+            if session_key:
+                # Always run Base's serialized cancellation path: even with no
+                # current owner it removes an orphaned/command-handoff event
+                # from _pending_messages and clears its debounce state.
                 await self.cancel_session_processing(session_key)
-            elif exact_owner is not None and not exact_owner.done():
+            if exact_owner is not None and not exact_owner.done():
                 exact_owner.cancel()
                 try:
                     await asyncio.wait_for(asyncio.shield(exact_owner), timeout=5.0)
                 except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
-            await asyncio.sleep(0)
             with self._pending_lock:
-                if task_id not in self._event_execution_started:
+                queued_event = (
+                    self._pending_messages.get(session_key)
+                    if session_key else None
+                )
+                if (
+                    queued_event is not None
+                    and str(getattr(queued_event, "message_id", "") or "") == task_id
+                ):
+                    self._pending_messages.pop(session_key, None)
+                    queued_event = None
+                if (
+                    task_id not in self._event_execution_started
+                    and queued_event is None
+                ):
                     self._queued_start_prevented.add(task_id)
                 return self._execution_stopped_locked(task_id)
 
@@ -1988,13 +2018,16 @@ class A2AAdapter(BasePlatformAdapter):
         streaming-delta protocol and may contain tool names or heartbeats.
         """
         is_final_reply = bool((metadata or {}).get("notify"))
+        # Redaction may scan the full bounded result. Perform it once, before
+        # taking the state lock, so attacker-controlled output cannot block
+        # unrelated gateway bookkeeping.
+        incoming = security.redact_outbound(content or "") if is_final_reply else ""
         with self._pending_lock:
             fut = self._pending_replies.get(chat_id)
             task_id = self._pending_tasks.get(chat_id)
             if fut is not None and not fut.done():
                 if not is_final_reply:
                     return SendResult(success=True, message_id=None)
-                incoming = security.redact_outbound(content or "")
                 if task_id:
                     try:
                         current = self._tasks.get_task(
@@ -2022,11 +2055,10 @@ class A2AAdapter(BasePlatformAdapter):
                             terminal_state = protocol.STATE_FAILED
                         else:
                             terminal_state = protocol.STATE_COMPLETED
-                        content = incoming
                         task, emitted = self._tasks.terminalize(
                             task_id,
                             terminal_state,
-                            security.redact_outbound(content or ""),
+                            incoming,
                             lease_owner=self._instance_id,
                             incarnation=int(current["incarnation"]),
                         )
