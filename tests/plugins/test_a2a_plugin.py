@@ -961,6 +961,37 @@ class TestClientTools:
         assert tools._host_authority("https://peer", "peer", 443) == "peer"
 
     @pytest.mark.parametrize(
+        ("field", "value"),
+        [("id", "../"), ("contextId", "line\nbreak")],
+    )
+    def test_response_rejects_unsafe_task_identifiers(self, field, value):
+        task = protocol.build_task("task-safe", "ctx-safe", protocol.STATE_COMPLETED, "ok")
+        task[field] = value
+        response = protocol.jsonrpc_result("rpc", task)
+        assert tools._jsonrpc_response_error(response)
+
+        task = protocol.build_task("task-safe", "ctx-safe", protocol.STATE_COMPLETED, "ok")
+        task["artifacts"][0]["artifactId"] = "../"
+        assert tools._jsonrpc_response_error(protocol.jsonrpc_result("rpc", task))
+
+    @pytest.mark.parametrize("depth", [300, 400])
+    def test_response_metadata_depth_is_bounded_without_recursion(self, depth):
+        nested = {}
+        cursor = nested
+        for _ in range(depth):
+            child = {}
+            cursor["child"] = child
+            cursor = child
+        task = protocol.build_task("task-safe", "ctx-safe", protocol.STATE_COMPLETED, "ok")
+        task["metadata"] = nested
+        assert tools._jsonrpc_response_error(protocol.jsonrpc_result("rpc", task))
+
+    def test_response_metadata_node_fanout_is_bounded(self):
+        task = protocol.build_task("task-safe", "ctx-safe", protocol.STATE_COMPLETED, "ok")
+        task["metadata"] = {str(index): index for index in range(10_001)}
+        assert tools._jsonrpc_response_error(protocol.jsonrpc_result("rpc", task))
+
+    @pytest.mark.parametrize(
         "url",
         ["not-a-url", "http://user:pass@host/", "http://host/?token=secret", "http://169.254.169.254/"],
     )

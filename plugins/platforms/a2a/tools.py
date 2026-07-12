@@ -463,8 +463,7 @@ def _jsonrpc_response_error(response: Any) -> str:
         if (
             not isinstance(artifact, dict)
             or set(artifact) - {"artifactId", "name", "description", "parts", "metadata"}
-            or not isinstance(artifact.get("artifactId"), str)
-            or not artifact.get("artifactId")
+            or not _valid_wire_identifier(artifact.get("artifactId"))
             or _parts_schema_error(artifact.get("parts"))
         ):
             return "result artifact is invalid"
@@ -481,18 +480,42 @@ def _jsonrpc_response_error(response: Any) -> str:
 
 
 def _json_value_error(value: Any) -> bool:
-    if value is None or isinstance(value, (str, bool, int)):
-        return False
-    if isinstance(value, float):
-        return not math.isfinite(value)
-    if isinstance(value, list):
-        return any(_json_value_error(item) for item in value)
-    if isinstance(value, dict):
-        return any(
-            not isinstance(key, str) or _json_value_error(item)
-            for key, item in value.items()
-        )
-    return True
+    max_depth = 64
+    max_nodes = 10_000
+    max_bytes = 1024 * 1024
+    nodes = 0
+    size = 0
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    while stack:
+        item, depth = stack.pop()
+        nodes += 1
+        if nodes > max_nodes or depth > max_depth:
+            return True
+        if item is None or isinstance(item, (bool, int)):
+            continue
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                return True
+            continue
+        if isinstance(item, str):
+            size += len(item.encode("utf-8"))
+            if size > max_bytes:
+                return True
+            continue
+        if isinstance(item, list):
+            stack.extend((child, depth + 1) for child in item)
+            continue
+        if isinstance(item, dict):
+            for key, child in item.items():
+                if not isinstance(key, str):
+                    return True
+                size += len(key.encode("utf-8"))
+                if size > max_bytes:
+                    return True
+                stack.append((child, depth + 1))
+            continue
+        return True
+    return False
 
 
 def _valid_json_metadata(value: Any) -> bool:
@@ -500,15 +523,10 @@ def _valid_json_metadata(value: Any) -> bool:
 
 
 def _valid_wire_identifier(value: Any) -> bool:
-    if isinstance(value, str) and re.fullmatch(
-        r"(?:task-[0-9a-f]{16}(?:-status)?|ctx-[0-9a-f]{16})", value
-    ):
-        return True
-    return (
-        isinstance(value, str)
-        and bool(value)
-        and security.redact_public_text(value) == value
-    )
+    if not isinstance(value, str) or not _SAFE_EXTERNAL_ID.fullmatch(value):
+        return False
+    redaction_target = value[5:] if value.startswith("task-") else value
+    return security.redact_public_text(redaction_target) == redaction_target
 
 
 def _parts_schema_error(parts: Any) -> bool:
