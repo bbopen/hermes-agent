@@ -27,6 +27,16 @@ description: >
 
   Pure stdlib transport (http.server + urllib) — no a2a-sdk dependency required.
 author: Nous Research
+config_schema:
+  type: object
+  properties:
+    host: {type: string}
+    port: {type: integer, minimum: 0, maximum: 65535}
+    advertised_url:
+      type: string
+      description: "Exact public http(s) origin; required for wildcard binds."
+    trusted_peers: {type: object}
+    capability_tools: {type: object}
 # requires_env / optional_env are surfaced in the `hermes config` UI via the
 # platform-plugin env var injector in hermes_cli/config.py.
 requires_env: []

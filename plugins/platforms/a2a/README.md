@@ -20,6 +20,7 @@ gateway:
       extra:
         host: "0.0.0.0"
         port: 9900
+        advertised_url: "http://hms-m1:9900/"
         agent_name: "worker"
         request_timeout: 15
         reply_timeout: 120
@@ -82,6 +83,10 @@ reply is returned over A2A.
   (each with a distinct `key_id` and `token_env`), OBO/capability grants, and
   `capability_tools`. Two active keys are supported during rotation; revoked
   and expired keys stop authenticating on the next request.
+- **Wildcard binds need an explicit public origin.** When `host` is `0.0.0.0`
+  or `::`, set `advertised_url` to the exact `http(s)` origin peers use (for
+  example a tailnet hostname). Userinfo, query strings, fragments, paths, and
+  wildcard hosts are rejected; the client still pins RPC calls to that origin.
 - Inbound text is run through prompt-injection filters and framed as untrusted
   peer input.
 - Outbound text is scrubbed of credential-shaped strings.

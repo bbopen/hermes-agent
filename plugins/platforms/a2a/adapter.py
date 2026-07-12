@@ -187,8 +187,20 @@ class A2AAdapter(BasePlatformAdapter):
         self._profile_home = Path(get_hermes_home())
         self.port = int(extra.get("port") or os.getenv("A2A_PORT") or _DEFAULT_PORT)
         with self._profile_runtime_scope():
+            self._config_error = security.validate_inbound_config(extra)
             self.host = security.resolve_bind_host(extra)
             self._localhost_only = security.localhost_only(extra)
+        try:
+            self._advertised_url = security.validate_advertised_url(
+                extra.get("advertised_url")
+            )
+        except ValueError as exc:
+            self._advertised_url = ""
+            self._config_error = self._config_error or str(exc)
+        if self.host in {"0.0.0.0", "::"} and not self._advertised_url:
+            self._config_error = self._config_error or (
+                "wildcard A2A bind requires an explicit valid advertised_url"
+            )
         self.agent_name = security.redact_public_text(_default_agent_name(extra))
         self.reply_timeout = _bounded_int(
             extra.get("reply_timeout", _REPLY_TIMEOUT),
@@ -358,6 +370,12 @@ class A2AAdapter(BasePlatformAdapter):
         # plugin compatible with the BasePlatformAdapter lifecycle contract.
         # Capture the running gateway loop so the HTTP thread can marshal
         # events onto it via run_coroutine_threadsafe.
+        if self._config_error:
+            self._set_fatal_error(
+                "invalid_config", f"A2A configuration rejected: {self._config_error}",
+                retryable=False,
+            )
+            return False
         try:
             self._loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -413,6 +431,9 @@ class A2AAdapter(BasePlatformAdapter):
                 self.wfile.write(body)
 
             def do_GET(self):  # noqa: N802
+                if adapter._config_error:
+                    self._json(503, {"status": "error", "error": "invalid A2A configuration"})
+                    return
                 if self.path.rstrip("/") in ("/.well-known/agent.json", "/.well-known/agent-card.json"):
                     self._json(200, adapter._build_card())
                     return
@@ -663,7 +684,7 @@ class A2AAdapter(BasePlatformAdapter):
         safe_toolsets = [security.redact_public_text(str(name)) for name in toolsets]
         card = protocol.build_agent_card(
             name=self.agent_name,
-            url=f"http://{self.host}:{self.port}/",
+            url=self._advertised_url or f"http://{self.host}:{self.port}/",
             description=description,
             skills=protocol.skills_from_toolsets(safe_toolsets),
             streaming=False,

@@ -13,6 +13,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+from pathlib import Path
 import sqlite3
 import stat
 import tempfile
@@ -41,6 +42,15 @@ def _audit_process_writer(home: str, event_id: str, start) -> None:
         "terminal", "peer", "task", "", status="completed", event_id=event_id,
     ):
         raise RuntimeError("audit write failed")
+
+
+def _task_store_process(path: str, start, results) -> None:
+    start.wait(timeout=5)
+    try:
+        TaskStore(Path(path))
+        results.put("")
+    except Exception as exc:
+        results.put(repr(exc))
 
 
 # --------------------------------------------------------------------------
@@ -99,6 +109,18 @@ class TestBindSafety:
 
 
 class TestBearerAuth:
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            {"trusted_peers": {"peer": {"on_behalf_of": "brett", "capabilities": ["proof"]}}},
+            {"trusted_peers": {"peer": {"on_behalf_of": ["brett"], "capabilities": {"proof": True}}}},
+            {"capability_tools": {False: ["terminal"]}},
+            {"capability_tools": {"proof": {"terminal": True}}},
+        ],
+    )
+    def test_nested_policy_schema_rejects_non_lists_and_non_string_keys(self, extra):
+        assert security.validate_inbound_config(extra)
+
     def test_no_token_accepts_anything(self, monkeypatch):
         monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
         assert security.check_bearer(None) is True
@@ -248,6 +270,14 @@ class TestOutboundRedaction:
         )
         redacted = security.redact_outbound("".join(secrets))
         assert all(secret.strip() not in redacted for secret in secrets)
+
+    @pytest.mark.parametrize("prefix", ["joined", "A1B2C3"])
+    def test_recognized_secret_concatenation_is_fully_redacted(self, prefix):
+        secret = "github_pat_11AA22bb33CC44dd55EE66ff77GG88hh"
+        value = prefix + secret
+        redacted = security.redact_outbound(value)
+        assert secret not in redacted
+        assert value not in redacted
 
     def test_github_token_redacted(self):
         out = security.redact_outbound("token ghp_0123456789abcdefghij0123")
@@ -678,6 +708,28 @@ class TestDurableControlPlane:
                 lease_owner="instance-a", incarnation=task["incarnation"],
             )
 
+    def test_expired_never_dispatched_cancel_intent_recovers_canceled(
+        self, monkeypatch, tmp_path,
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        store = TaskStore()
+        task, _ = self._claim(store, request="cancel-crash", lease_seconds=30)
+        store.request_cancel(
+            task["task_id"], principal="peer-a", on_behalf_of="brett",
+            capability="system.proof", backstop="gateway.cancel_session_processing",
+        )
+        conn = store._connect()
+        try:
+            conn.execute(
+                "UPDATE tasks SET lease_expires_at = ? WHERE task_id = ?",
+                (time.time() - 1, task["task_id"]),
+            )
+        finally:
+            conn.close()
+        recovered = store.reconcile_after_restart()
+        assert recovered[0]["state"] == protocol.STATE_CANCELED
+        assert recovered[0]["dispatched_at"] is None
+
     def test_outbox_claim_retry_and_terminal_pending_delivered_state(
         self, monkeypatch, tmp_path,
     ):
@@ -792,6 +844,42 @@ class TestDurableControlPlane:
         assert legacy["dispatched_at"] == 2
         assert legacy["execution_uncertain_at"] is not None
         assert legacy["stop_reason"] == "legacy-unleased"
+
+    @pytest.mark.parametrize("legacy", [False, True])
+    def test_schema_initialization_is_cross_process_serialized(self, tmp_path, legacy):
+        path = tmp_path / "tasks.sqlite3"
+        if legacy:
+            conn = sqlite3.connect(path)
+            conn.executescript("""
+                CREATE TABLE contexts (
+                    context_id TEXT PRIMARY KEY, principal TEXT NOT NULL,
+                    on_behalf_of TEXT NOT NULL, created_at REAL NOT NULL
+                );
+                CREATE TABLE tasks (
+                    task_id TEXT PRIMARY KEY, context_id TEXT NOT NULL,
+                    principal TEXT NOT NULL, on_behalf_of TEXT NOT NULL,
+                    capability TEXT NOT NULL, request_key TEXT NOT NULL,
+                    payload_sha256 TEXT NOT NULL, state TEXT NOT NULL,
+                    result_text TEXT NOT NULL DEFAULT '', deadline_at REAL,
+                    cancel_requested_at REAL, cancellation_backstop TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL, updated_at REAL NOT NULL
+                );
+            """)
+            conn.close()
+        context = multiprocessing.get_context("spawn")
+        start = context.Barrier(3)
+        results = context.Queue()
+        processes = [
+            context.Process(target=_task_store_process, args=(str(path), start, results))
+            for _ in range(2)
+        ]
+        for process in processes:
+            process.start()
+        start.wait(timeout=5)
+        for process in processes:
+            process.join(timeout=15)
+            assert process.exitcode == 0
+        assert [results.get(timeout=2) for _ in processes] == ["", ""]
 
     def test_secondary_multiplex_a2a_is_explicitly_gated(self):
         from gateway.run import _PORT_BINDING_PLATFORM_VALUES
@@ -912,7 +1000,7 @@ class TestClientTools:
             tools, "_http_post_json",
             lambda *args: pytest.fail("unsafe metadata reached the wire"),
         )
-        secret = "github_pat_11AA22bb33CC44dd55EE66ff77GG88hh"
+        secret = "joinedgithub_pat_11AA22bb33CC44dd55EE66ff77GG88hh"
         args = {"agent": "peer", "message": "safe", field: secret}
         out = tools.a2a_call(args)
         assert field in out
@@ -1081,6 +1169,57 @@ class TestRegistryDispatchConvention:
 # --------------------------------------------------------------------------
 
 class TestReplyCapture:
+    def test_wildcard_bind_requires_explicit_valid_advertised_origin(
+        self, monkeypatch,
+    ):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        monkeypatch.setenv("REMOTE_TOKEN", "active-token")
+        peer = {
+            "credentials": [{"key_id": "current", "token_env": "REMOTE_TOKEN"}],
+            "on_behalf_of": ["brett"], "capabilities": ["proof"],
+        }
+        missing = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "host": "0.0.0.0", "port": 0, "trusted_peers": {"peer": peer},
+            "capability_tools": {"proof": []},
+        }))
+        assert asyncio.run(missing.connect()) is False
+
+        valid = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "host": "0.0.0.0", "port": 0,
+            "advertised_url": "http://hms-m1:9900/",
+            "trusted_peers": {"peer": peer}, "capability_tools": {"proof": []},
+        }))
+        assert valid._config_error == ""
+        assert valid._build_card()["url"] == "http://hms-m1:9900/"
+        with pytest.raises(ValueError):
+            security.validate_advertised_url("http://public.example.com:9900/")
+        assert security.validate_advertised_url(
+            "https://public.example.com/"
+        ) == "https://public.example.com/"
+
+    def test_unusable_configured_auth_fails_startup_and_card_stays_protected(
+        self, monkeypatch,
+    ):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        monkeypatch.setenv("EXPIRED_TOKEN", "expired-token")
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "trusted_peers": {"peer": {
+                "credentials": [{
+                    "key_id": "expired", "token_env": "EXPIRED_TOKEN",
+                    "expires_at": time.time() - 1,
+                }],
+                "on_behalf_of": ["brett"], "capabilities": ["proof"],
+            }},
+            "capability_tools": {"proof": []},
+        }))
+        assert adapter._config_error
+        assert adapter._build_card()["security"] == [{"bearer": []}]
+        assert asyncio.run(adapter.connect()) is False
+
     def test_send_waits_for_notify_marked_final_reply(self):
         """Interim/editable sends must not satisfy the blocked A2A RPC future."""
         from plugins.platforms.a2a.adapter import A2AAdapter
@@ -1286,7 +1425,7 @@ class TestTaskTerminalControls:
             task_id=protocol.new_task_id(), deadline_at=None,
             lease_owner=adapter._instance_id, lease_seconds=60,
         )
-        secret = "github_pat_11AA22bb33CC44dd55EE66ff77GG88hh"
+        secret = "joinedgithub_pat_11AA22bb33CC44dd55EE66ff77GG88hh"
         stored = adapter._finish_task(task, protocol.STATE_COMPLETED, secret)
         assert secret not in stored["result_text"]
 
@@ -1916,8 +2055,8 @@ class TestInboundRoundTrip:
 
         card_secret = "AIza" + "A" * 35
         cfg = PlatformConfig(enabled=True, extra={
-            "agent_name": f"worker-{card_secret}",
-            "agent_description": f"description {card_secret}",
+            "agent_name": f"workerX{card_secret}",
+            "agent_description": f"descriptionX{card_secret}",
         })
         adapter = A2AAdapter(cfg)
 

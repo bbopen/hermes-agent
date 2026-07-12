@@ -28,6 +28,7 @@ import re
 import hashlib
 import threading
 import time
+from urllib.parse import urlsplit
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -226,6 +227,87 @@ def configured_trusted_peers(
     ]
 
 
+def validate_inbound_config(extra: Mapping[str, Any]) -> str:
+    """Return a controlled error for malformed or unusable remote policy."""
+    peers = extra.get("trusted_peers")
+    if peers is not None:
+        if not isinstance(peers, Mapping) or not peers:
+            return "trusted_peers must be a non-empty mapping"
+        for principal, raw in peers.items():
+            if not isinstance(principal, str) or not principal.strip():
+                return "trusted_peers keys must be non-empty strings"
+            if not isinstance(raw, Mapping):
+                return f"trusted_peers.{principal} must be a mapping"
+            for field in ("on_behalf_of", "capabilities"):
+                values = raw.get(field)
+                if not isinstance(values, list) or not values or any(
+                    not isinstance(value, str) or not value.strip() for value in values
+                ):
+                    return f"trusted_peers.{principal}.{field} must be a non-empty list of strings"
+        if not configured_trusted_peers(extra):
+            return "trusted_peers has no usable active credentials"
+    grants = extra.get("capability_tools")
+    if grants is not None:
+        if not isinstance(grants, Mapping):
+            return "capability_tools must be a mapping"
+        for capability, tools in grants.items():
+            if not isinstance(capability, str) or not capability.strip():
+                return "capability_tools keys must be non-empty strings"
+            if not isinstance(tools, list) or any(
+                not isinstance(tool, str) or not tool.strip() for tool in tools
+            ):
+                return f"capability_tools.{capability} must be a list of non-empty strings"
+    return ""
+
+
+def validate_advertised_url(value: Any) -> str:
+    """Validate one explicit public origin; return its normalized URL."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if redact_public_text(raw) != raw:
+        raise ValueError("advertised_url contains credential-shaped content")
+    try:
+        parsed = urlsplit(raw)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+            or parsed.hostname in {"0.0.0.0", "::"}
+        ):
+            raise ValueError
+        _ = parsed.port
+        if parsed.scheme == "http":
+            try:
+                address = ipaddress.ip_address(parsed.hostname)
+                safe_http = (
+                    address.is_loopback
+                    or address.is_private
+                    or (
+                        address.version == 4
+                        and address in ipaddress.ip_network("100.64.0.0/10")
+                    )
+                )
+            except ValueError:
+                hostname = parsed.hostname.lower()
+                safe_http = (
+                    hostname == "localhost"
+                    or "." not in hostname
+                    or hostname.endswith(".ts.net")
+                )
+            if not safe_http:
+                raise ValueError
+    except ValueError as exc:
+        raise ValueError(
+            "advertised_url must be one exact non-wildcard origin; public DNS requires https"
+        ) from exc
+    return raw.rstrip("/") + "/"
+
+
 def _has_trusted_peer_config(extra: Mapping[str, Any]) -> bool:
     peers = extra.get("trusted_peers")
     if peers is None:
@@ -310,7 +392,7 @@ def has_inbound_credentials(extra: Optional[Mapping[str, Any]] = None) -> bool:
 
 def requires_auth(extra: Optional[Mapping[str, Any]] = None) -> bool:
     """Whether the local HTTP edge requires an Authorization header."""
-    return has_inbound_credentials(extra) or bool(get_bearer_token())
+    return _has_trusted_peer_config(extra or {}) or bool(get_bearer_token())
 
 
 def localhost_only(extra: Optional[Mapping[str, Any]] = None) -> bool:
@@ -415,32 +497,30 @@ def redact_outbound(text: str) -> str:
     # A2A is a mandatory disclosure boundary: user-level log redaction opt-out
     # must never permit credentials to cross it. Reuse the maintained core
     # corpus so new vendor formats are covered here automatically.
-    from agent.redact import redact_sensitive_text
+    from agent.redact import _PREFIX_SUBSTRINGS, redact_sensitive_text
 
-    return _EMAIL_RE.sub(
+    redacted = _EMAIL_RE.sub(
         "[redacted-email]",
         redact_sensitive_text(text, force=True),
     )
+    if redacted != text:
+        return redacted
+    # Core log redaction uses token boundaries for fidelity. A2A is a network
+    # disclosure boundary, so recognized vendor prefixes remain secret even
+    # when concatenated to attacker-controlled alphanumeric text.
+    for prefix in _PREFIX_SUBSTRINGS:
+        start = text.find(prefix)
+        while start >= 0:
+            probe = " " + text[start:]
+            if redact_sensitive_text(probe, force=True)[1:] != text[start:]:
+                return "[redacted]"
+            start = text.find(prefix, start + 1)
+    return text
 
 
 def redact_public_text(text: str) -> str:
     """Redact a short public metadata field, including embedded key substrings."""
-    redacted = redact_outbound(text)
-    if redacted != text or not text:
-        return redacted
-    # The shared redactor deliberately applies token-boundary guards for log
-    # fidelity. Public metadata has no reason to retain a field containing a
-    # credential after punctuation (for example ``worker-AIza...``), so probe
-    # every suffix through the same forced corpus and redact the whole field.
-    from agent.redact import redact_sensitive_text
-
-    for index in range(1, len(text)):
-        if text[index - 1].isalnum():
-            continue
-        probe = " " + text[index:]
-        if redact_sensitive_text(probe, force=True)[1:] != text[index:]:
-            return "[redacted]"
-    return text
+    return redact_outbound(text)
 
 
 # --------------------------------------------------------------------------

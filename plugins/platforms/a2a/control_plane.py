@@ -9,6 +9,7 @@ profile cannot both dispatch or complete the same logical request.
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import math
 import os
@@ -132,8 +133,25 @@ class TaskStore:
                 os.chmod(path.parent, 0o700)
             except OSError:
                 pass
-            conn = sqlite3.connect(path, timeout=10, isolation_level=None)
+            lock_fd = os.open(
+                path.with_suffix(path.suffix + ".schema.lock"),
+                os.O_CREAT | os.O_RDWR,
+                0o600,
+            )
+            deadline = time.monotonic() + 30.0
+            while True:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError as exc:
+                    if time.monotonic() >= deadline:
+                        os.close(lock_fd)
+                        raise ControlPlaneError("timed out waiting for schema migration") from exc
+                    time.sleep(0.05)
+            conn: Optional[sqlite3.Connection] = None
             try:
+                conn = sqlite3.connect(path, timeout=30, isolation_level=None)
+                conn.execute("PRAGMA busy_timeout = 30000")
                 conn.execute("PRAGMA journal_mode = WAL")
                 conn.execute("PRAGMA synchronous = FULL")
                 preexisting_task_columns = {
@@ -276,7 +294,10 @@ class TaskStore:
                     pass
                 self._initialized = True
             finally:
-                conn.close()
+                if conn is not None:
+                    conn.close()
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
 
     @staticmethod
     def _task(conn: sqlite3.Connection, task_id: str) -> Optional[dict[str, Any]]:
@@ -840,6 +861,16 @@ class TaskStore:
                         recovered.append(stored)
                     continue
                 if task["dispatched_at"] is None:
+                    if task["cancel_requested_at"] is not None:
+                        stored, _ = self._terminalize_locked(
+                            conn,
+                            task,
+                            protocol.STATE_CANCELED,
+                            "[task canceled before dispatch]",
+                            now,
+                        )
+                        recovered.append(stored)
+                        continue
                     result = (
                         "[task deadline elapsed before dispatch]"
                         if deadline_due
