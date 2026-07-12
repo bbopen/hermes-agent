@@ -512,6 +512,25 @@ class A2AAdapter(BasePlatformAdapter):
                 self._event_execution_started.add(task_id)
                 if current is not None:
                     self._owned_session_tasks[task_id] = current
+        if not tracked and task_id:
+            # Process-local tombstones are intentionally removed after a task
+            # is fully cleaned up. The durable ledger is the long-lived fence:
+            # any late retained/replacement event for a known task has already
+            # lost its only authorized dispatch and must never enter Base.
+            try:
+                durable_task = self._tasks.get_task(
+                    task_id, enforce_capability=False,
+                )
+            except Exception:
+                logger.warning(
+                    "A2A: refusing untracked event %s because its durable "
+                    "dispatch state could not be verified",
+                    task_id,
+                    exc_info=True,
+                )
+                return
+            if durable_task is not None:
+                return
         try:
             await super()._process_message_background(event, session_key)
         finally:

@@ -1727,6 +1727,22 @@ class TestReplyCapture:
             await adapter._process_message_background(event, session_key)
             assert called is False
 
+            # Normal terminal cleanup removes process-local maps/tombstones.
+            # The durable task ledger remains the permanent no-replay fence.
+            with adapter._pending_lock:
+                adapter._active_tasks.pop(task_id, None)
+                adapter._dispatch_stop_requested.discard(task_id)
+                adapter._queued_start_prevented.discard(task_id)
+            monkeypatch.setattr(
+                adapter._tasks,
+                "get_task",
+                lambda *_args, **_kwargs: {
+                    "task_id": task_id, "state": protocol.STATE_FAILED,
+                },
+            )
+            await adapter._process_message_background(event, session_key)
+            assert called is False
+
         asyncio.run(run())
 
     def test_final_result_admission_uses_exact_wire_encoder_for_ascii_and_emoji(
