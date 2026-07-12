@@ -18,7 +18,10 @@ Layers (all opt-out-able only by explicit config, never silently):
 from __future__ import annotations
 
 import hmac
-import fcntl
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - native Windows
+    fcntl = None  # type: ignore[assignment]
 import ipaddress
 import json
 import logging
@@ -29,7 +32,8 @@ import socket
 import hashlib
 import threading
 import time
-from urllib.parse import urlsplit
+import unicodedata
+from urllib.parse import unquote, urlsplit
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -239,6 +243,8 @@ def validate_inbound_config(extra: Mapping[str, Any]) -> str:
                 return "trusted_peers keys must be non-empty strings"
             if not isinstance(raw, Mapping):
                 return f"trusted_peers.{principal} must be a mapping"
+            if "enabled" in raw and type(raw["enabled"]) is not bool:
+                return f"trusted_peers.{principal}.enabled must be a boolean"
             for field in ("on_behalf_of", "capabilities"):
                 values = raw.get(field)
                 if not isinstance(values, list) or not values or any(
@@ -345,6 +351,10 @@ def validate_advertised_url(value: Any) -> str:
         ):
             raise ValueError
         port = parsed.port
+        decoded_host = unicodedata.normalize("NFKC", unquote(hostname))
+        if any(char.isspace() for char in decoded_host):
+            raise ValueError
+        hostname = decoded_host.encode("idna").decode("ascii")
         try:
             address = ipaddress.ip_address(hostname)
             canonical_host = address.compressed
@@ -583,7 +593,7 @@ def redact_outbound(text: str) -> str:
     # A2A is a mandatory disclosure boundary: user-level log redaction opt-out
     # must never permit credentials to cross it. Reuse the maintained core
     # corpus so new vendor formats are covered here automatically.
-    from agent.redact import _PREFIX_SUBSTRINGS, redact_sensitive_text
+    from agent.redact import _PREFIX_PATTERNS, _PREFIX_SUBSTRINGS, redact_sensitive_text
 
     redacted = _EMAIL_RE.sub(
         "[redacted-email]",
@@ -591,6 +601,8 @@ def redact_outbound(text: str) -> str:
     )
     if redacted != text:
         return redacted
+    if any(re.search(pattern, text) for pattern in _PREFIX_PATTERNS):
+        return "[redacted]"
     # Core log redaction uses token boundaries for fidelity. A2A is a network
     # disclosure boundary, so recognized vendor prefixes remain secret even
     # when concatenated to attacker-controlled alphanumeric text.
@@ -667,6 +679,8 @@ def audit_event_present(event_id: str) -> bool:
         return False
     path = _audit_path()
     try:
+        if fcntl is None:
+            return False
         with _AUDIT_LOCK:
             fd = os.open(path, os.O_RDWR)
             try:
@@ -699,6 +713,8 @@ def audit(
     deliberately observable and must never silently downgrade task auditing.
     """
     try:
+        if fcntl is None:
+            raise OSError("cross-process audit locking is unavailable")
         safe_event_id = safe_structured_identifier(event_id)
         rec = {
             "ts": time.time(),

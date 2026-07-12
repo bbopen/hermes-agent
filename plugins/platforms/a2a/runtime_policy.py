@@ -82,7 +82,7 @@ def enforce_tool_scope(tool_name: str = "", args: object = None, **_: object):
     actual = args if isinstance(args, dict) else {}
     for field, allowed_values in rules.items():
         value = actual.get(field)
-        if value not in allowed_values:
+        if not any(type(value) is type(allowed) and value == allowed for allowed in allowed_values):
             return {
                 "action": "block",
                 "message": (

@@ -99,6 +99,14 @@ def _safe_external_id(value: Any) -> bool:
     )
 
 
+def _valid_jsonrpc_id(value: Any) -> bool:
+    return (
+        value is None
+        or isinstance(value, str)
+        or type(value) in {int, float} and math.isfinite(value)
+    )
+
+
 def _default_agent_name(extra: Optional[dict] = None) -> str:
     name = str((extra or {}).get("agent_name") or os.getenv("A2A_AGENT_NAME", "")).strip()
     if name:
@@ -187,6 +195,8 @@ class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
 class A2AAdapter(BasePlatformAdapter):
     """Inbound A2A server adapter."""
 
+    supports_async_delivery = False
+
     def __init__(self, config, **kwargs):
         platform = Platform("a2a")
         super().__init__(config=config, platform=platform)
@@ -266,6 +276,7 @@ class A2AAdapter(BasePlatformAdapter):
         self._active_session_keys: Dict[str, str] = {}
         self._dispatch_futures: Dict[str, Future] = {}
         self._lease_heartbeats: Dict[str, float] = {}
+        self._stream_buffers: Dict[str, str] = {}
         self._pending_lock = threading.Lock()
 
     @contextmanager
@@ -444,7 +455,8 @@ class A2AAdapter(BasePlatformAdapter):
                 self.wfile.write(body)
 
             def do_GET(self):  # noqa: N802
-                if adapter._config_error:
+                live_config_error = security.validate_inbound_config(adapter.extra)
+                if adapter._config_error or live_config_error:
                     self._json(503, {"status": "error", "error": "invalid A2A configuration"})
                     return
                 if self.path.rstrip("/") in ("/.well-known/agent.json", "/.well-known/agent-card.json"):
@@ -487,7 +499,12 @@ class A2AAdapter(BasePlatformAdapter):
                     raw = self.rfile.read(length)
                     if len(raw) != length:
                         raise ValueError("incomplete request body")
-                    req = json.loads(raw.decode("utf-8"))
+                    req = json.loads(
+                        raw.decode("utf-8"),
+                        parse_constant=lambda value: (_ for _ in ()).throw(
+                            ValueError(f"invalid JSON constant: {value}")
+                        ),
+                    )
                 except Exception:
                     self._json(400, protocol.jsonrpc_error(None, -32700, "parse error"))
                     return
@@ -497,13 +514,23 @@ class A2AAdapter(BasePlatformAdapter):
                     return
 
                 req_id = req.get("id")
+                if "id" not in req:
+                    self._json(400, protocol.jsonrpc_error(
+                        None, -32600, "JSON-RPC notifications are not supported",
+                    ))
+                    return
+                if not _valid_jsonrpc_id(req_id):
+                    self._json(400, protocol.jsonrpc_error(
+                        None, -32600, "invalid JSON-RPC id",
+                    ))
+                    return
                 if isinstance(req_id, str) and not _safe_external_id(req_id):
                     self._json(400, protocol.jsonrpc_error(
                         None, -32600, "request id contains forbidden credential material",
                     ))
                     return
                 method = req.get("method", "")
-                params = req.get("params", {}) or {}
+                params = req.get("params", {})
                 requested_versions = self.headers.get_all("A2A-Version", failobj=[])
                 if req.get("jsonrpc") != "2.0":
                     self._json(400, protocol.jsonrpc_error(
@@ -683,6 +710,7 @@ class A2AAdapter(BasePlatformAdapter):
             self._active_session_keys.clear()
             self._dispatch_futures.clear()
             self._lease_heartbeats.clear()
+            self._stream_buffers.clear()
 
     # ── Agent Card ────────────────────────────────────────────────────────
 
@@ -1126,6 +1154,7 @@ class A2AAdapter(BasePlatformAdapter):
                 self._active_session_keys.pop(task_id, None)
                 self._dispatch_futures.pop(task_id, None)
                 self._lease_heartbeats.pop(task_id, None)
+                self._stream_buffers.pop(context_id, None)
             deactivate(context_id)
             return task_to_wire(self._finish_task(
                 task, protocol.STATE_FAILED, f"Dispatch failed: {e}"
@@ -1230,6 +1259,7 @@ class A2AAdapter(BasePlatformAdapter):
                 self._active_session_keys.pop(task_id, None)
                 self._dispatch_futures.pop(task_id, None)
                 self._lease_heartbeats.pop(task_id, None)
+                self._stream_buffers.pop(context_id, None)
             deactivate(context_id)
 
         final_task = self._tasks.get_task(task_id, enforce_capability=False)
@@ -1265,8 +1295,17 @@ class A2AAdapter(BasePlatformAdapter):
             task_id = self._pending_tasks.get(chat_id)
             if fut is not None and not fut.done():
                 if not is_final_reply:
-                    logger.debug("A2A: ignoring non-final send for context %s", chat_id)
-                    return SendResult(success=True, message_id=str(int(time.time() * 1000)))
+                    if (content or "").startswith("⏩"):
+                        return SendResult(success=True, message_id=None)
+                    previous = self._stream_buffers.get(chat_id, "")
+                    incoming = security.redact_outbound(content or "")
+                    self._stream_buffers[chat_id] = (
+                        incoming if incoming.startswith(previous) else previous + incoming
+                    )
+                    return SendResult(success=True, message_id=None)
+                previous = self._stream_buffers.pop(chat_id, "")
+                incoming = security.redact_outbound(content or "")
+                content = incoming if incoming.startswith(previous) else previous + incoming
                 if task_id:
                     try:
                         current = self._tasks.get_task(
@@ -1301,7 +1340,7 @@ class A2AAdapter(BasePlatformAdapter):
                 return SendResult(success=True, message_id=str(int(time.time() * 1000)))
         # No waiter (e.g. a late streamed chunk or out-of-band send) — drop it.
         logger.debug("A2A: send() for context %s had no pending waiter", chat_id)
-        return SendResult(success=True, message_id=str(int(time.time() * 1000)))
+        return SendResult(success=False, error="A2A task is no longer accepting replies")
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         return None

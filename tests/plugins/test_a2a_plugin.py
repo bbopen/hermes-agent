@@ -109,6 +109,12 @@ class TestBindSafety:
 
 
 class TestBearerAuth:
+    @pytest.mark.parametrize("enabled", ["false", 0, 1, None])
+    def test_trusted_peer_enabled_requires_literal_boolean(self, enabled):
+        assert security.validate_inbound_config({"trusted_peers": {"peer": {
+            "enabled": enabled, "credentials": [],
+            "on_behalf_of": ["brett"], "capabilities": ["proof"],
+        }}})
     @pytest.mark.parametrize(
         "extra",
         [
@@ -260,6 +266,9 @@ class TestInjectionFilter:
 
 
 class TestOutboundRedaction:
+    def test_fixed_length_secret_embedded_on_both_sides_is_redacted(self):
+        value = "joinedAKIA1234567890ABCDEFtail"
+        assert value not in security.redact_outbound(value)
     def test_openai_key_redacted(self):
         out = security.redact_outbound("my key is sk-abcdefghij1234567890XYZ")
         assert "sk-abcdefghij" not in out
@@ -296,6 +305,13 @@ class TestOutboundRedaction:
 
 
 class TestAudit:
+    def test_missing_posix_locking_fails_cleanly(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(security, "fcntl", None)
+        assert security.audit("inbound", "peer", "task", "body") is False
+        monkeypatch.setattr(control_plane, "fcntl", None)
+        with pytest.raises(control_plane.ControlPlaneError, match="file locking"):
+            TaskStore(tmp_path / "unsupported.sqlite3")
     def test_audit_writes_jsonl(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         # Reset any cached hermes_home resolution by pointing at tmp dir.
@@ -911,6 +927,10 @@ class TestDurableControlPlane:
 # --------------------------------------------------------------------------
 
 class TestClientTools:
+    @pytest.mark.parametrize("peers", [["peer"], {"peer": "bad"}, {"peer": {"url": "http://x", "auth": []}}])
+    def test_malformed_outbound_peer_config_is_controlled(self, monkeypatch, peers):
+        monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": peers})
+        assert "Error:" in tools.a2a_call({"agent": "peer", "message": "hello"})
     def test_call_requires_args(self):
         assert "required" in tools.a2a_call({"agent": "", "message": "hi"})
         assert "required" in tools.a2a_call({"agent": "x", "message": ""})
@@ -1188,6 +1208,30 @@ class TestRegistryDispatchConvention:
 # --------------------------------------------------------------------------
 
 class TestReplyCapture:
+    def test_stream_preview_accumulates_and_commits_exact_final_once(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        adapter = A2AAdapter(PlatformConfig(enabled=True))
+        future = Future()
+        adapter._pending_replies["ctx-stream"] = future
+
+        async def run():
+            first = await adapter.send("ctx-stream", "hello ", metadata={"expect_edits": True})
+            second = await adapter.send("ctx-stream", "hello world", metadata={"expect_edits": True})
+            assert first.message_id is None and second.message_id is None
+            await adapter.send("ctx-stream", "hello world!", metadata={"notify": True})
+
+        asyncio.run(run())
+        assert future.result(timeout=0) == "hello world!"
+    def test_a2a_disables_async_delivery_and_late_send_fails(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        adapter = A2AAdapter(PlatformConfig(enabled=True))
+        assert adapter.supports_async_delivery is False
+        result = asyncio.run(adapter.send("gone", "late", metadata={"notify": True}))
+        assert result.success is False
     def test_wildcard_bind_requires_explicit_valid_advertised_origin(
         self, monkeypatch,
     ):
@@ -1221,6 +1265,13 @@ class TestReplyCapture:
             "http://0:9900/",
             "http://0x0:9900/",
             "http://[::ffff:0.0.0.0]:9900/",
+        ):
+            with pytest.raises(ValueError):
+                security.validate_advertised_url(url)
+        for url in (
+            "http://０:9900/", "http://⓪:9900/", "http://𝟢:9900/",
+            "http://𝟘:9900/", "http://０.０.０.０:9900/",
+            "http://%30%78%30:9900/", "http://%30.%30.%30.%30:9900/",
         ):
             with pytest.raises(ValueError):
                 security.validate_advertised_url(url)
@@ -1306,6 +1357,22 @@ class TestReplyCapture:
 
 
 class TestCapabilityEnforcement:
+    def test_rule_matching_distinguishes_bool_from_int(self, monkeypatch):
+        monkeypatch.setattr(
+            "gateway.session_context.get_session_env",
+            lambda name, default="": {"HERMES_SESSION_PLATFORM": "a2a", "HERMES_SESSION_CHAT_ID": "ctx-bool"}.get(name, default),
+        )
+        policy = runtime_policy.ActivePolicy(
+            principal="peer", on_behalf_of="brett", capability="proof",
+            allowed_tools=frozenset({"terminal"}),
+            tool_rules={"terminal": {"flag": frozenset({False})}},
+        )
+        assert runtime_policy.activate("ctx-bool", policy)
+        try:
+            assert runtime_policy.enforce_tool_scope("terminal", {"flag": 0})["action"] == "block"
+            assert runtime_policy.enforce_tool_scope("terminal", {"flag": False}) is None
+        finally:
+            runtime_policy.deactivate("ctx-bool")
     def test_non_a2a_sessions_are_untouched(self, monkeypatch):
         monkeypatch.setattr(
             "gateway.session_context.get_session_env",

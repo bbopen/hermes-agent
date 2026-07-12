@@ -9,7 +9,10 @@ profile cannot both dispatch or complete the same logical request.
 from __future__ import annotations
 
 import hashlib
-import fcntl
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - native Windows
+    fcntl = None  # type: ignore[assignment]
 import json
 import math
 import os
@@ -128,6 +131,10 @@ class TaskStore:
             if self._initialized:
                 return
             path = self.path
+            if fcntl is None:
+                raise ControlPlaneError(
+                    "A2A durable state requires cross-process file locking unavailable on this platform"
+                )
             path.parent.mkdir(parents=True, exist_ok=True)
             try:
                 os.chmod(path.parent, 0o700)

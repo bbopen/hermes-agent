@@ -126,7 +126,10 @@ def _pinned_addresses(
     scheme = parts.scheme
     port = parts.port or (443 if scheme == "https" else 80)
     deadline = deadline or (time.monotonic() + _DEFAULT_TIMEOUT)
-    allow_private = _configured_origin_allowed(url, _load_config())
+    allow_private = (
+        _configured_origin_allowed(url, _load_config())
+        and _is_non_public_host(host)
+    )
     try:
         parsed = ipaddress.ip_address(host)
         addresses = [(
@@ -201,7 +204,12 @@ def _pinned_json_request(
         raw = response.read(_MAX_OUTBOUND_RESPONSE_BYTES + 1)
         if len(raw) > _MAX_OUTBOUND_RESPONSE_BYTES:
             raise ValueError("peer response is too large")
-        return json.loads(raw.decode("utf-8"))
+        return json.loads(
+            raw.decode("utf-8"),
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"invalid JSON constant: {value}")
+            ),
+        )
     finally:
         try:
             sock.close()
@@ -239,7 +247,7 @@ def _is_non_public_host(host: str) -> bool:
     """
     lowered = host.lower().rstrip(".")
     if lowered in {"localhost", "localhost.localdomain"} or lowered.endswith(
-        (".localhost", ".local", ".internal")
+        (".localhost", ".local", ".internal", ".ts.net")
     ) or "." not in lowered:
         return True
     try:
@@ -302,18 +310,36 @@ def _resolve_peer(agent: str) -> Optional[dict]:
         return {"url": agent, "auth": {}, "timeout": _DEFAULT_TIMEOUT, "configured": False}
     cfg = _load_config()
     peers = cfg.get("a2a_agents") or {}
+    if not isinstance(peers, dict):
+        return {"error": "a2a_agents must be a mapping"}
     entry = peers.get(agent)
     if not entry:
         return None
+    if not isinstance(entry, dict):
+        return {"error": f"a2a_agents.{agent} must be a mapping"}
+    auth = entry.get("auth", {}) or {}
+    if not isinstance(auth, dict):
+        return {"error": f"a2a_agents.{agent}.auth must be a mapping"}
+    if not isinstance(entry.get("url"), str) or not entry.get("url", "").strip():
+        return {"error": f"a2a_agents.{agent}.url must be a non-empty string"}
+    if auth:
+        if auth.get("type") != "bearer":
+            return {"error": f"a2a_agents.{agent}.auth.type must be 'bearer'"}
+        for field in ("key_env", "key_id", "credential_id", "token"):
+            if field in auth and not isinstance(auth[field], str):
+                return {"error": f"a2a_agents.{agent}.auth.{field} must be a string"}
+    for field in ("on_behalf_of", "capability"):
+        if field in entry and not isinstance(entry[field], str):
+            return {"error": f"a2a_agents.{agent}.{field} must be a string"}
     try:
         timeout = float(entry.get("timeout", _DEFAULT_TIMEOUT))
     except (TypeError, ValueError):
-        timeout = float(_DEFAULT_TIMEOUT)
+        return {"error": f"a2a_agents.{agent}.timeout must be numeric"}
     if not math.isfinite(timeout) or timeout <= 0:
-        timeout = float(_DEFAULT_TIMEOUT)
+        return {"error": f"a2a_agents.{agent}.timeout must be positive and finite"}
     return {
         "url": entry.get("url", ""),
-        "auth": entry.get("auth", {}) or {},
+        "auth": auth,
         "timeout": min(timeout, 3600.0),
         "on_behalf_of": str(entry.get("on_behalf_of") or ""),
         "capability": str(entry.get("capability") or ""),
@@ -322,6 +348,8 @@ def _resolve_peer(agent: str) -> Optional[dict]:
 
 
 def _auth_header(auth: dict) -> dict:
+    if not isinstance(auth, dict):
+        return {}
     if auth and auth.get("type") == "bearer":
         key_env = str(auth.get("key_env") or "").strip()
         token = security._credential_value(key_env) if key_env else ""
@@ -439,6 +467,8 @@ def a2a_call(args: dict, **_: Any) -> str:
         return unsafe
 
     peer = _resolve_peer(agent)
+    if peer and peer.get("error"):
+        return f"Error: invalid A2A peer configuration — {peer['error']}."
     if not peer or not peer.get("url"):
         return (
             f"Error: unknown agent '{agent}'. Configure it under 'a2a_agents' in "
@@ -557,6 +587,11 @@ def a2a_call(args: dict, **_: Any) -> str:
         return f"Error: call to '{agent}' failed — HTTP {e.code}."
     except Exception as e:
         return f"Error: call to '{agent}' failed — {e}."
+
+    if not isinstance(resp, dict) or resp.get("jsonrpc") != "2.0":
+        return f"Error: peer '{agent}' returned an invalid JSON-RPC response."
+    if resp.get("id") != rpc_body["id"]:
+        return f"Error: peer '{agent}' returned a mismatched JSON-RPC response id."
 
     if "error" in resp:
         err = resp["error"]
