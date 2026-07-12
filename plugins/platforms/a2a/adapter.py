@@ -70,7 +70,6 @@ _REPLY_TIMEOUT = 300  # seconds to wait for the agent to answer an inbound task
 _DEFAULT_MAX_REQUEST_BYTES = 128 * 1024
 _DEFAULT_MAX_INFLIGHT_REQUESTS = 16
 _MAX_RESPONSE_BYTES = 512 * 1024
-_MAX_RESULT_TEXT_BYTES = 480 * 1024
 _MAX_JSON_NODES = 10_000
 _MAX_JSON_DEPTH = 64
 
@@ -106,9 +105,7 @@ def _safe_external_id(value: Any) -> bool:
 def _valid_jsonrpc_id(value: Any) -> bool:
     if value is None or isinstance(value, str):
         return True
-    if type(value) is int:
-        return -(2**53 - 1) <= value <= 2**53 - 1
-    return type(value) is float and math.isfinite(value)
+    return type(value) is int and -(2**53 - 1) <= value <= 2**53 - 1
 
 
 def _parse_json_int(value: str) -> int:
@@ -174,7 +171,26 @@ def _metadata_schema_error(metadata: Any) -> str:
     for field in ("on_behalf_of", "capability", "idempotencyKey"):
         if field in metadata and not isinstance(metadata[field], str):
             return f"metadata.{field} must be a string"
+    if "deadline" in metadata:
+        deadline = metadata["deadline"]
+        if (
+            isinstance(deadline, bool)
+            or not isinstance(deadline, (str, int, float))
+            or isinstance(deadline, float) and not math.isfinite(deadline)
+            or isinstance(deadline, str) and not deadline.strip()
+        ):
+            return "metadata.deadline must be a finite timestamp"
     return ""
+
+
+def _wire_json_bytes(payload: Any) -> bytes:
+    """One canonical encoder shared by result admission and HTTP emission."""
+    return json.dumps(
+        payload,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 def _message_schema_error(message: Any) -> str:
@@ -434,6 +450,10 @@ class A2AAdapter(BasePlatformAdapter):
         self._active_tasks: Dict[str, str] = {}
         self._active_session_keys: Dict[str, str] = {}
         self._dispatch_futures: Dict[str, Future] = {}
+        self._dispatch_registration_pending: set[str] = set()
+        self._dispatch_stop_requested: set[str] = set()
+        self._dispatch_handoff_complete: set[str] = set()
+        self._owned_session_tasks: Dict[str, asyncio.Task] = {}
         self._lease_heartbeats: Dict[str, float] = {}
         self._stream_buffers: Dict[str, str] = {}
         self._pending_lock = threading.Lock()
@@ -606,17 +626,14 @@ class A2AAdapter(BasePlatformAdapter):
                 logger.debug("A2A http: " + format, *args)
 
             def _json(self, code: int, payload: dict):
-                body = json.dumps(
-                    payload, ensure_ascii=True, allow_nan=False,
-                    separators=(",", ":"),
-                ).encode("utf-8")
+                body = _wire_json_bytes(payload)
                 if len(body) > _MAX_RESPONSE_BYTES:
                     code = 500
-                    body = json.dumps(protocol.jsonrpc_error(
+                    body = _wire_json_bytes(protocol.jsonrpc_error(
                         payload.get("id") if isinstance(payload, dict) else None,
                         -32011,
                         "A2A response exceeds the supported size limit",
-                    ), separators=(",", ":")).encode("utf-8")
+                    ))
                 self._a2a_response_started = True
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
@@ -953,15 +970,16 @@ class A2AAdapter(BasePlatformAdapter):
         for task_id in active:
             try:
                 current = self._tasks.get_task(task_id, enforce_capability=False)
-                if current is None or current["state"] in TERMINAL_STATES:
-                    stopped.add(task_id)
-                    continue
-                self._tasks.request_stop(
-                    task_id,
-                    reason="shutdown",
-                    backstop="gateway.cancel_session_processing",
-                )
+                if current is None:
+                    raise ControlPlaneError("durable task state disappeared")
+                if current["state"] not in TERMINAL_STATES:
+                    self._tasks.request_stop(
+                        task_id,
+                        reason="shutdown",
+                        backstop="gateway.cancel_session_processing",
+                    )
                 with self._pending_lock:
+                    self._dispatch_stop_requested.add(task_id)
                     dispatch = self._dispatch_futures.get(task_id)
                     session_key = self._active_session_keys.get(task_id)
                 if dispatch is not None and not dispatch.done():
@@ -969,11 +987,8 @@ class A2AAdapter(BasePlatformAdapter):
                 if session_key:
                     await self.cancel_session_processing(session_key)
                 await asyncio.sleep(0)
-                session_task = self._session_tasks.get(session_key) if session_key else None
-                execution_stopped = (
-                    (dispatch is None or dispatch.done())
-                    and (session_task is None or session_task.done())
-                )
+                with self._pending_lock:
+                    execution_stopped = self._execution_stopped_locked(task_id)
                 current = self._tasks.get_task(task_id, enforce_capability=False) or current
                 if execution_stopped:
                     try:
@@ -1026,6 +1041,10 @@ class A2AAdapter(BasePlatformAdapter):
                 self._active_tasks.pop(task_id, None)
                 self._active_session_keys.pop(task_id, None)
                 self._dispatch_futures.pop(task_id, None)
+                self._dispatch_registration_pending.discard(task_id)
+                self._dispatch_stop_requested.discard(task_id)
+                self._dispatch_handoff_complete.discard(task_id)
+                self._owned_session_tasks.pop(task_id, None)
                 self._lease_heartbeats.pop(task_id, None)
                 self._stream_buffers.pop(context_id, None)
         for context_id in stopped_contexts.values():
@@ -1196,38 +1215,65 @@ class A2AAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _deadline(params: dict) -> Optional[float]:
-        """Parse a request deadline as Unix seconds/milliseconds or RFC3339."""
+        """Parse every deadline alias and require one canonical value."""
         message = params.get("message") or {}
-        metadata = message.get("metadata") if isinstance(message, dict) else None
-        metadata = metadata if isinstance(metadata, dict) else {}
-        raw = params.get("deadline", metadata.get("deadline"))
-        if raw in (None, ""):
+        message_metadata = message.get("metadata") if isinstance(message, dict) else None
+        message_metadata = message_metadata if isinstance(message_metadata, dict) else {}
+        params_metadata = params.get("metadata")
+        params_metadata = params_metadata if isinstance(params_metadata, dict) else {}
+        aliases = []
+        if "deadline" in params:
+            aliases.append(params["deadline"])
+        if "deadline" in message_metadata:
+            aliases.append(message_metadata["deadline"])
+        if "deadline" in params_metadata:
+            aliases.append(params_metadata["deadline"])
+        if not aliases:
             return None
-        if isinstance(raw, bool):
-            raise ValueError("deadline must be a timestamp")
-        if isinstance(raw, (int, float)):
-            value = float(raw)
-            if not math.isfinite(value):
-                raise ValueError("deadline must be finite")
-            return value / 1000 if value > 10_000_000_000 else value
-        if not isinstance(raw, str):
-            raise ValueError("deadline must be a timestamp")
-        try:
+
+        def parse(raw: Any) -> float:
+            if isinstance(raw, bool):
+                raise ValueError("deadline must be a timestamp")
+            if isinstance(raw, (int, float)):
+                value = float(raw)
+                if not math.isfinite(value):
+                    raise ValueError("deadline must be finite")
+                return value / 1000 if value > 10_000_000_000 else value
+            if not isinstance(raw, str) or not raw.strip():
+                raise ValueError("deadline must be a timestamp")
             try:
-                numeric = float(raw)
-            except ValueError:
-                numeric = None
-            if numeric is not None:
-                return A2AAdapter._deadline({"deadline": numeric})
-            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            if parsed.tzinfo is None:
-                raise ValueError("deadline must include a timezone")
-            value = parsed.timestamp()
-            if not math.isfinite(value):
-                raise ValueError("deadline must be finite")
-            return value
-        except (ValueError, OverflowError, OSError) as exc:
-            raise ValueError("deadline must be Unix time or RFC3339") from exc
+                try:
+                    numeric = float(raw)
+                except ValueError:
+                    numeric = None
+                if numeric is not None:
+                    return parse(numeric)
+                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    raise ValueError("deadline must include a timezone")
+                value = parsed.timestamp()
+                if not math.isfinite(value):
+                    raise ValueError("deadline must be finite")
+                return value
+            except (ValueError, OverflowError, OSError) as exc:
+                raise ValueError("deadline must be Unix time or RFC3339") from exc
+
+        values = [parse(raw) for raw in aliases]
+        if any(value != values[0] for value in values[1:]):
+            raise ValueError("conflicting deadline aliases")
+        return values[0]
+
+    def _execution_stopped_locked(self, task_id: str) -> bool:
+        """Return true only from explicit registered lifecycle evidence."""
+        if task_id in self._dispatch_registration_pending:
+            return False
+        dispatch = self._dispatch_futures.get(task_id)
+        if dispatch is None or not dispatch.done():
+            return False
+        if task_id not in self._dispatch_handoff_complete:
+            return False
+        owner = self._owned_session_tasks.get(task_id)
+        return owner is None or owner.done()
 
     def _interrupt_task(self, task_id: str) -> bool:
         """Interrupt and verify the gateway-owned execution task has exited."""
@@ -1235,7 +1281,11 @@ class A2AAdapter(BasePlatformAdapter):
             context_id = self._active_tasks.get(task_id)
             fut = self._pending_replies.get(context_id) if context_id else None
             session_key = self._active_session_keys.get(task_id)
+            self._dispatch_stop_requested.add(task_id)
+            registration_pending = task_id in self._dispatch_registration_pending
         if self._loop is None:
+            return False
+        if registration_pending:
             return False
 
         async def _cancel_and_verify() -> bool:
@@ -1243,15 +1293,14 @@ class A2AAdapter(BasePlatformAdapter):
             if dispatch is not None and not dispatch.done():
                 dispatch.cancel()
                 await asyncio.sleep(0)
-            if not session_key:
-                return False
-            session_task = self._session_tasks.get(session_key)
-            if session_task is None:
-                return False
-            if session_task.done():
-                return True
-            await self.cancel_session_processing(session_key)
-            return session_task.done()
+            session_task = self._owned_session_tasks.get(task_id)
+            if session_task is None and session_key:
+                session_task = self._session_tasks.get(session_key)
+            if session_task is not None and not session_task.done() and session_key:
+                await self.cancel_session_processing(session_key)
+            await asyncio.sleep(0)
+            with self._pending_lock:
+                return self._execution_stopped_locked(task_id)
 
         try:
             cancel = asyncio.run_coroutine_threadsafe(
@@ -1280,19 +1329,19 @@ class A2AAdapter(BasePlatformAdapter):
         def watch() -> None:
             while True:
                 with self._pending_lock:
-                    dispatch = self._dispatch_futures.get(task_id)
-                    session_key = self._active_session_keys.get(task_id)
-                    session_task = self._session_tasks.get(session_key) if session_key else None
-                    stopped = (
-                        (dispatch is None or dispatch.done())
-                        and (session_task is None or session_task.done())
-                    )
+                    if self._active_tasks.get(task_id) != context_id:
+                        return
+                    stopped = self._execution_stopped_locked(task_id)
                     if stopped:
                         self._pending_replies.pop(context_id, None)
                         self._pending_tasks.pop(context_id, None)
                         self._active_tasks.pop(task_id, None)
                         self._active_session_keys.pop(task_id, None)
                         self._dispatch_futures.pop(task_id, None)
+                        self._dispatch_registration_pending.discard(task_id)
+                        self._dispatch_stop_requested.discard(task_id)
+                        self._dispatch_handoff_complete.discard(task_id)
+                        self._owned_session_tasks.pop(task_id, None)
                         self._lease_heartbeats.pop(task_id, None)
                         self._stream_buffers.pop(context_id, None)
                 if stopped:
@@ -1437,6 +1486,11 @@ class A2AAdapter(BasePlatformAdapter):
                 metadata_payload.pop("deadline", None)
                 message_payload["metadata"] = metadata_payload
             payload["params"]["message"] = message_payload
+        params_metadata_payload = payload["params"].get("metadata")
+        if isinstance(params_metadata_payload, dict):
+            params_metadata_payload = dict(params_metadata_payload)
+            params_metadata_payload.pop("deadline", None)
+            payload["params"]["metadata"] = params_metadata_payload
         self._reconcile_durable_tasks()
         task, created = self._tasks.claim_request(
             principal=policy.principal,
@@ -1502,6 +1556,7 @@ class A2AAdapter(BasePlatformAdapter):
             self._pending_replies[context_id] = fut
             self._pending_tasks[context_id] = task_id
             self._active_tasks[task_id] = context_id
+            self._dispatch_registration_pending.add(task_id)
             self._lease_heartbeats[task_id] = time.monotonic()
 
         event = MessageEvent(
@@ -1547,6 +1602,10 @@ class A2AAdapter(BasePlatformAdapter):
                 self._active_tasks.pop(task_id, None)
                 self._active_session_keys.pop(task_id, None)
                 self._dispatch_futures.pop(task_id, None)
+                self._dispatch_registration_pending.discard(task_id)
+                self._dispatch_stop_requested.discard(task_id)
+                self._dispatch_handoff_complete.discard(task_id)
+                self._owned_session_tasks.pop(task_id, None)
                 self._lease_heartbeats.pop(task_id, None)
                 self._stream_buffers.pop(context_id, None)
             deactivate(context_id)
@@ -1557,6 +1616,10 @@ class A2AAdapter(BasePlatformAdapter):
                 self._pending_tasks.pop(context_id, None)
                 self._active_tasks.pop(task_id, None)
                 self._active_session_keys.pop(task_id, None)
+                self._dispatch_registration_pending.discard(task_id)
+                self._dispatch_stop_requested.discard(task_id)
+                self._dispatch_handoff_complete.discard(task_id)
+                self._owned_session_tasks.pop(task_id, None)
                 self._lease_heartbeats.pop(task_id, None)
             deactivate(context_id)
             if task.get("cancel_requested_at") is not None and task.get("dispatched_at") is None:
@@ -1577,12 +1640,40 @@ class A2AAdapter(BasePlatformAdapter):
                 ) or task
             return task_to_wire(task)
 
+        start_gate = asyncio.Event()
+
+        async def dispatch_with_handoff() -> None:
+            try:
+                await start_gate.wait()
+                await self.handle_message(event)
+            finally:
+                # BasePlatformAdapter.handle_message registers the background
+                # owner before it returns. Retain that exact Task even after
+                # the base map removes it; absence before this handoff is never
+                # treated as proof that queued execution cannot still start.
+                owner = self._session_tasks.get(session_key)
+                with self._pending_lock:
+                    if owner is not None:
+                        self._owned_session_tasks[task_id] = owner
+                    self._dispatch_handoff_complete.add(task_id)
+
         try:
             dispatch_future = asyncio.run_coroutine_threadsafe(
-                self.handle_message(event), self._loop
+                dispatch_with_handoff(), self._loop
             )
             with self._pending_lock:
                 self._dispatch_futures[task_id] = dispatch_future
+                self._dispatch_registration_pending.discard(task_id)
+                stop_before_start = task_id in self._dispatch_stop_requested
+                if stop_before_start:
+                    # The gate was never opened, so no gateway execution can
+                    # have started even if cancellation prevents the coroutine
+                    # from reaching its finally block.
+                    self._dispatch_handoff_complete.add(task_id)
+            if stop_before_start:
+                dispatch_future.cancel()
+            else:
+                self._loop.call_soon_threadsafe(start_gate.set)
         except Exception as e:
             with self._pending_lock:
                 self._pending_replies.pop(context_id, None)
@@ -1590,6 +1681,10 @@ class A2AAdapter(BasePlatformAdapter):
                 self._active_tasks.pop(task_id, None)
                 self._active_session_keys.pop(task_id, None)
                 self._dispatch_futures.pop(task_id, None)
+                self._dispatch_registration_pending.discard(task_id)
+                self._dispatch_stop_requested.discard(task_id)
+                self._dispatch_handoff_complete.discard(task_id)
+                self._owned_session_tasks.pop(task_id, None)
                 self._lease_heartbeats.pop(task_id, None)
                 self._stream_buffers.pop(context_id, None)
             deactivate(context_id)
@@ -1672,16 +1767,11 @@ class A2AAdapter(BasePlatformAdapter):
             except Exception:
                 current = None
             with self._pending_lock:
-                dispatch = self._dispatch_futures.get(task_id)
-                session_key = self._active_session_keys.get(task_id)
-                session_task = self._session_tasks.get(session_key) if session_key else None
+                execution_stopped = self._execution_stopped_locked(task_id)
             if (
                 current is not None
                 and current.get("execution_uncertain_at") is not None
-                and not (
-                    (dispatch is None or dispatch.done())
-                    and (session_task is None or session_task.done())
-                )
+                and not execution_stopped
             ):
                 release_authority = False
         except _LeaseLost:
@@ -1769,6 +1859,10 @@ class A2AAdapter(BasePlatformAdapter):
                     self._active_tasks.pop(task_id, None)
                     self._active_session_keys.pop(task_id, None)
                     self._dispatch_futures.pop(task_id, None)
+                    self._dispatch_registration_pending.discard(task_id)
+                    self._dispatch_stop_requested.discard(task_id)
+                    self._dispatch_handoff_complete.discard(task_id)
+                    self._owned_session_tasks.pop(task_id, None)
                     self._lease_heartbeats.pop(task_id, None)
                     self._stream_buffers.pop(context_id, None)
                 deactivate(context_id)
@@ -1810,12 +1904,6 @@ class A2AAdapter(BasePlatformAdapter):
                 if not is_final_reply:
                     return SendResult(success=True, message_id=None)
                 incoming = security.redact_outbound(content or "")
-                if len(incoming.encode("utf-8")) > _MAX_RESULT_TEXT_BYTES:
-                    incoming = "[agent result exceeds the supported A2A response size limit]"
-                    terminal_state = protocol.STATE_FAILED
-                else:
-                    terminal_state = protocol.STATE_COMPLETED
-                content = incoming
                 if task_id:
                     try:
                         current = self._tasks.get_task(
@@ -1823,6 +1911,27 @@ class A2AAdapter(BasePlatformAdapter):
                         )
                         if current is None:
                             raise InvalidTaskState("durable task state disappeared")
+                        candidate = protocol.build_task(
+                            security.safe_structured_identifier(current["task_id"]),
+                            security.safe_structured_identifier(current["context_id"]),
+                            protocol.STATE_COMPLETED,
+                            incoming,
+                            timestamp=float(current.get("updated_at") or time.time()),
+                        )
+                        # Reserve the largest accepted JSON-RPC string id. The
+                        # exact HTTP encoder is shared with emission, so Unicode
+                        # escaping and envelope overhead cannot create an
+                        # accepted-but-unretrievable durable result.
+                        if len(_wire_json_bytes(protocol.jsonrpc_result(
+                            "x" * 128, candidate,
+                        ))) > _MAX_RESPONSE_BYTES:
+                            incoming = (
+                                "[agent result exceeds the supported A2A response size limit]"
+                            )
+                            terminal_state = protocol.STATE_FAILED
+                        else:
+                            terminal_state = protocol.STATE_COMPLETED
+                        content = incoming
                         task, emitted = self._tasks.terminalize(
                             task_id,
                             terminal_state,
@@ -1850,7 +1959,7 @@ class A2AAdapter(BasePlatformAdapter):
                 else:
                     # Retain the adapter's historical direct-send behavior for
                     # gateway/plugin callers that have no durable A2A task.
-                    fut.set_result(content or "")
+                    fut.set_result(incoming)
                 return SendResult(success=True, message_id=str(int(time.time() * 1000)))
         # No waiter (e.g. a late streamed chunk or out-of-band send) — drop it.
         logger.debug("A2A: send() for context %s had no pending waiter", chat_id)

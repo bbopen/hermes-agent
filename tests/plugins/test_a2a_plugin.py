@@ -1344,11 +1344,44 @@ class TestClientTools:
         out = tools.a2a_call({"agent": "worker", "message": "prove it"})
         assert token not in out
 
+    def test_agent_card_protocol_error_cannot_reflect_exact_bearer(self, monkeypatch):
+        token = "opaquepeercredential"
+        monkeypatch.setenv("WORKER_A2A_TOKEN", token)
+        monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {
+            "worker": {
+                "url": "http://hms-m1:9900",
+                "auth": {"type": "bearer", "key_env": "WORKER_A2A_TOKEN"},
+            }
+        }})
+        card = protocol.build_agent_card(
+            name="worker", url="http://hms-m1:9900/", description="worker",
+        )
+        card["protocolVersion"] = token
+        monkeypatch.setattr(tools, "_http_get_json", lambda *args: card)
+        monkeypatch.setattr(tools, "_http_post_json", lambda *args: pytest.fail(
+            "unsupported card reached task submission"
+        ))
+        out = tools.a2a_call({"agent": "worker", "message": "prove it"})
+        assert "unsupported A2A protocol version" in out
+        assert token not in out
+
     def test_server_control_extension_is_producer_consumer_compatible(self):
         task = protocol.build_task("task-safe", "ctx-safe", protocol.STATE_WORKING)
         task["x-hermes-control"] = {"execution": "uncertain", "cancellation": "requested"}
         assert tools._jsonrpc_response_error(protocol.jsonrpc_result("rpc", task)) == ""
         task["x-hermes-control"]["execution"] = "maybe"
+        assert tools._jsonrpc_response_error(protocol.jsonrpc_result("rpc", task))
+
+    def test_empty_response_message_and_artifact_parts_are_rejected(self):
+        task = protocol.build_task(
+            "task-safe", "ctx-safe", protocol.STATE_COMPLETED, "ok",
+        )
+        task["artifacts"][0]["parts"] = []
+        assert tools._jsonrpc_response_error(protocol.jsonrpc_result("rpc", task))
+        task = protocol.build_task("task-safe", "ctx-safe", protocol.STATE_WORKING)
+        task["status"]["message"] = {
+            "role": "agent", "messageId": "message-safe", "parts": [],
+        }
         assert tools._jsonrpc_response_error(protocol.jsonrpc_result("rpc", task))
 
     @pytest.mark.parametrize(
@@ -1556,6 +1589,77 @@ class TestRegistryDispatchConvention:
 # --------------------------------------------------------------------------
 
 class TestReplyCapture:
+    def test_final_result_admission_uses_exact_wire_encoder_for_ascii_and_emoji(
+        self, monkeypatch, tmp_path,
+    ):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.a2a import adapter as adapter_module
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = A2AAdapter(PlatformConfig(enabled=True))
+
+        def task_for(context_id, request_key):
+            task, _ = adapter._tasks.claim_request(
+                principal="localhost", on_behalf_of="", capability="",
+                request_key=request_key,
+                payload_sha256=canonical_payload_sha256({"message": request_key}),
+                requested_context_id=context_id, task_id=protocol.new_task_id(),
+                deadline_at=None, lease_owner=adapter._instance_id, lease_seconds=60,
+            )
+            task, dispatched = adapter._tasks.mark_dispatched(
+                task["task_id"], owner=adapter._instance_id,
+                incarnation=task["incarnation"], lease_seconds=60,
+            )
+            assert dispatched
+            with adapter._pending_lock:
+                adapter._pending_replies[context_id] = Future()
+                adapter._pending_tasks[context_id] = task["task_id"]
+            return task
+
+        ascii_task = task_for("ctx-ascii-boundary", "ascii-boundary")
+        low, high = 0, adapter_module._MAX_RESPONSE_BYTES
+        while low < high:
+            middle = (low + high + 1) // 2
+            candidate = protocol.build_task(
+                ascii_task["task_id"], ascii_task["context_id"],
+                protocol.STATE_COMPLETED, "a" * middle,
+                timestamp=ascii_task["updated_at"],
+            )
+            size = len(adapter_module._wire_json_bytes(
+                protocol.jsonrpc_result("x" * 128, candidate),
+            ))
+            if size <= adapter_module._MAX_RESPONSE_BYTES:
+                low = middle
+            else:
+                high = middle - 1
+        asyncio.run(adapter.send(
+            "ctx-ascii-boundary", "a" * low, metadata={"notify": True},
+        ))
+        stored = adapter._tasks.get_task(
+            ascii_task["task_id"], enforce_capability=False,
+        )
+        assert stored["state"] == protocol.STATE_COMPLETED
+        assert len(stored["result_text"]) == low
+        wire = control_plane.task_to_wire(stored)
+        assert len(adapter_module._wire_json_bytes(
+            protocol.jsonrpc_result("x" * 128, wire),
+        )) <= adapter_module._MAX_RESPONSE_BYTES
+
+        emoji_task = task_for("ctx-emoji-boundary", "emoji-boundary")
+        asyncio.run(adapter.send(
+            "ctx-emoji-boundary", "😀" * 100_000, metadata={"notify": True},
+        ))
+        stored = adapter._tasks.get_task(
+            emoji_task["task_id"], enforce_capability=False,
+        )
+        assert stored["state"] == protocol.STATE_FAILED
+        assert "response size limit" in stored["result_text"]
+        wire = control_plane.task_to_wire(stored)
+        assert len(adapter_module._wire_json_bytes(
+            protocol.jsonrpc_result("x" * 128, wire),
+        )) <= adapter_module._MAX_RESPONSE_BYTES
+
     def test_final_persistence_failure_fails_send_and_waiter(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.a2a.adapter import A2AAdapter
@@ -1770,6 +1874,8 @@ class TestReplyCapture:
                 adapter._active_tasks[task["task_id"]] = "ctx-disconnect"
                 adapter._active_session_keys[task["task_id"]] = "a2a:ctx-disconnect"
                 adapter._dispatch_futures[task["task_id"]] = dispatch
+                adapter._dispatch_handoff_complete.add(task["task_id"])
+                adapter._owned_session_tasks[task["task_id"]] = session_task
             adapter._session_tasks["a2a:ctx-disconnect"] = session_task
 
             async def cancel_session(session_key):
@@ -1826,6 +1932,8 @@ class TestReplyCapture:
                 adapter._active_tasks[task["task_id"]] = "ctx-unconfirmed"
                 adapter._active_session_keys[task["task_id"]] = "a2a:ctx-unconfirmed"
                 adapter._dispatch_futures[task["task_id"]] = dispatch
+                adapter._dispatch_handoff_complete.add(task["task_id"])
+                adapter._owned_session_tasks[task["task_id"]] = session_task
             adapter._session_tasks["a2a:ctx-unconfirmed"] = session_task
 
             async def cannot_stop(_session_key):
@@ -1843,6 +1951,65 @@ class TestReplyCapture:
                 await session_task
             await asyncio.sleep(0.15)
             assert runtime_policy.get("ctx-unconfirmed") is None
+            assert task["task_id"] not in adapter._active_tasks
+
+        asyncio.run(run())
+
+    def test_disconnect_never_treats_pending_dispatch_registration_as_stopped(
+        self, monkeypatch, tmp_path,
+    ):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = A2AAdapter(PlatformConfig(enabled=True))
+        task, _ = adapter._tasks.claim_request(
+            principal="localhost", on_behalf_of="", capability="",
+            request_key="queued-unregistered",
+            payload_sha256=canonical_payload_sha256({"message": "queued"}),
+            requested_context_id="ctx-queued", task_id=protocol.new_task_id(),
+            deadline_at=None, lease_owner=adapter._instance_id, lease_seconds=60,
+        )
+        task, dispatched = adapter._tasks.mark_dispatched(
+            task["task_id"], owner=adapter._instance_id,
+            incarnation=task["incarnation"], lease_seconds=60,
+        )
+        assert dispatched
+        policy = runtime_policy.ActivePolicy(
+            principal="localhost", on_behalf_of="", capability="",
+            allowed_tools=frozenset({"*"}),
+        )
+        assert runtime_policy.activate("ctx-queued", policy)
+
+        async def run():
+            with adapter._pending_lock:
+                adapter._pending_replies["ctx-queued"] = Future()
+                adapter._pending_tasks["ctx-queued"] = task["task_id"]
+                adapter._active_tasks[task["task_id"]] = "ctx-queued"
+                adapter._active_session_keys[task["task_id"]] = "a2a:ctx-queued"
+                adapter._dispatch_registration_pending.add(task["task_id"])
+
+            async def cannot_stop(_session_key):
+                return None
+
+            monkeypatch.setattr(adapter, "cancel_session_processing", cannot_stop)
+            await adapter.disconnect()
+            stored = adapter._tasks.get_task(task["task_id"], enforce_capability=False)
+            assert stored["state"] == protocol.STATE_WORKING
+            assert stored["execution_uncertain_at"] is not None
+            assert runtime_policy.get("ctx-queued") == policy
+            assert task["task_id"] in adapter._active_tasks
+
+            # Resolve the registration fence as canceled-before-start. Only
+            # this explicit evidence permits the watcher to release policy.
+            dispatch = Future()
+            dispatch.cancel()
+            with adapter._pending_lock:
+                adapter._dispatch_registration_pending.discard(task["task_id"])
+                adapter._dispatch_futures[task["task_id"]] = dispatch
+                adapter._dispatch_handoff_complete.add(task["task_id"])
+            await asyncio.sleep(0.15)
+            assert runtime_policy.get("ctx-queued") is None
             assert task["task_id"] not in adapter._active_tasks
 
         asyncio.run(run())
@@ -1959,6 +2126,34 @@ class TestRequestPolicy:
             adapter_module._parse_json_int("9" * 4000)
         with pytest.raises(ValueError):
             adapter_module._parse_json_float("1e400")
+        assert adapter_module._valid_jsonrpc_id(1)
+        assert not adapter_module._valid_jsonrpc_id(True)
+        assert not adapter_module._valid_jsonrpc_id(1.5)
+        assert not adapter_module._valid_jsonrpc_id(1e308)
+        assert adapter_module._metadata_schema_error({"deadline": []})
+        assert adapter_module._metadata_schema_error({"deadline": float("inf")})
+
+    def test_deadline_aliases_are_parsed_and_must_agree(self):
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        deadline = time.time() + 60
+        params = {
+            "deadline": deadline,
+            "metadata": {"deadline": str(deadline)},
+            "message": {
+                **protocol.text_message("user", "hello"),
+                "metadata": {"deadline": deadline},
+            },
+        }
+        assert A2AAdapter._deadline(params) == deadline
+        params["metadata"]["deadline"] = deadline + 1
+        with pytest.raises(ValueError, match="conflicting deadline aliases"):
+            A2AAdapter._deadline(params)
+        with pytest.raises(ValueError, match="Unix time or RFC3339"):
+            A2AAdapter._deadline({
+                "message": protocol.text_message("user", "hello"),
+                "metadata": {"deadline": "not-a-date"},
+            })
 
     def test_authenticated_identity_replaces_caller_peer(self, monkeypatch):
         monkeypatch.setenv("SPARK_A2A_TOKEN", "secret")
@@ -2422,6 +2617,16 @@ class TestPrincipalBoundTaskHTTP:
                 with pytest.raises(urllib.error.HTTPError) as rejected:
                     await asyncio.to_thread(
                         post, versioned, "token-a", "a-current", invalid_version,
+                )
+                assert rejected.value.code == 400
+            for invalid_id in (True, 1.5, 1e308):
+                invalid_identifier = {
+                    "jsonrpc": "2.0", "id": invalid_id,
+                    "method": "message/send", "params": valid_params,
+                }
+                with pytest.raises(urllib.error.HTTPError) as rejected:
+                    await asyncio.to_thread(
+                        post, invalid_identifier, "token-a", "a-current",
                     )
                 assert rejected.value.code == 400
             identifier_secret = "joinedgithub_pat_11AA22bb33CC44dd55EE66ff77GG88hh"
@@ -2910,6 +3115,19 @@ class TestInboundRoundTrip:
                 malformed["params"]["message"]["parts"][0]["type"] = "text"
                 malformed["junk"] = 1e300
                 assert await asyncio.to_thread(raw_post, "/", malformed, valid_auth) == 400
+                malformed_deadline = json.loads(json.dumps(valid))
+                malformed_deadline["params"]["metadata"] = {"deadline": []}
+                assert await asyncio.to_thread(
+                    raw_post, "/", malformed_deadline, valid_auth,
+                ) == 400
+                conflicting_deadline = json.loads(json.dumps(valid))
+                conflicting_deadline["params"]["deadline"] = time.time() + 60
+                conflicting_deadline["params"]["metadata"] = {
+                    "deadline": time.time() + 120,
+                }
+                assert await asyncio.to_thread(
+                    raw_post, "/", conflicting_deadline, valid_auth,
+                ) == 400
                 assert await asyncio.to_thread(
                     raw_post, "/", valid,
                     (

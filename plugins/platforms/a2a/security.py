@@ -640,10 +640,12 @@ def redact_outbound(text: str) -> str:
     # corpus so new vendor formats are covered here automatically.
     from agent.redact import _PREFIX_PATTERNS, _PREFIX_SUBSTRINGS, redact_sensitive_text
 
-    redacted = _EMAIL_RE.sub(
-        "[redacted-email]",
-        redact_sensitive_text(text, force=True),
-    )
+    redacted = redact_sensitive_text(text, force=True)
+    # The email pattern begins with a greedy local-part matcher; running it at
+    # every position of a large string without any '@' is quadratic. Preserve
+    # the same semantics while keeping bounded A2A result admission linear.
+    if "@" in redacted:
+        redacted = _EMAIL_RE.sub("[redacted-email]", redacted)
     if redacted != text:
         return redacted
     if any(re.search(pattern, text) for pattern in _PREFIX_PATTERNS):

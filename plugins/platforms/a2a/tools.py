@@ -610,7 +610,7 @@ def _valid_wire_identifier(value: Any) -> bool:
 
 
 def _parts_schema_error(parts: Any) -> bool:
-    return not isinstance(parts, list) or any(
+    return not isinstance(parts, list) or not parts or any(
         not isinstance(part, dict)
         or set(part) - {"kind", "type", "text"}
         or ("kind" in part) == ("type" in part)
@@ -975,10 +975,10 @@ def a2a_call(args: dict, **_: Any) -> str:
         if card_error:
             return f"Error: peer '{agent}' returned an invalid Agent Card — {card_error}."
     if card is not None and card.get("protocolVersion") != protocol.PROTOCOL_VERSION:
-        return (
-            f"Error: peer '{agent}' advertises unsupported A2A protocol version "
-            f"{card.get('protocolVersion')!r}."
-        )
+        # Agent Card fields are untrusted peer bytes. Never interpolate them:
+        # a peer can reflect the exact bearer it just received even when that
+        # credential has no recognizable vendor shape.
+        return f"Error: peer '{agent}' advertises an unsupported A2A protocol version."
 
     unknown_outcome: Optional[Exception] = None
     try:
