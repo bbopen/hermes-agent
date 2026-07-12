@@ -25,6 +25,7 @@ import logging
 import math
 import os
 import re
+import socket
 import hashlib
 import threading
 import time
@@ -257,7 +258,70 @@ def validate_inbound_config(extra: Mapping[str, Any]) -> str:
                 not isinstance(tool, str) or not tool.strip() for tool in tools
             ):
                 return f"capability_tools.{capability} must be a list of non-empty strings"
+    rules = extra.get("capability_tool_rules")
+    if rules is not None:
+        if not isinstance(rules, Mapping):
+            return "capability_tool_rules must be a mapping"
+        for capability, tool_rules in rules.items():
+            if not isinstance(capability, str) or not capability.strip():
+                return "capability_tool_rules keys must be non-empty strings"
+            if not isinstance(tool_rules, Mapping):
+                return f"capability_tool_rules.{capability} must be a mapping"
+            for tool, fields in tool_rules.items():
+                if not isinstance(tool, str) or not tool.strip() or not isinstance(fields, Mapping):
+                    return f"capability_tool_rules.{capability} tools must map names to fields"
+                for field, allowed in fields.items():
+                    if not isinstance(field, str) or not field.strip():
+                        return f"capability_tool_rules.{capability}.{tool} fields must be strings"
+                    if not isinstance(allowed, (list, set, frozenset)) or not allowed:
+                        return f"capability_tool_rules.{capability}.{tool}.{field} must be non-empty"
+                    if any(
+                        not isinstance(value, (str, int, float, bool))
+                        for value in allowed
+                    ):
+                        return f"capability_tool_rules.{capability}.{tool}.{field} values must be scalar"
     return ""
+
+
+def is_wildcard_host(value: Any) -> bool:
+    """Recognize every supported textual alias for an INADDR_ANY bind."""
+    host = str(value or "").strip().strip("[]")
+    try:
+        address = ipaddress.ip_address(host)
+        return address.is_unspecified or bool(
+            address.version == 6
+            and address.ipv4_mapped is not None
+            and address.ipv4_mapped.is_unspecified
+        )
+    except ValueError:
+        try:
+            return socket.inet_ntoa(socket.inet_aton(host)) == "0.0.0.0"
+        except OSError:
+            return False
+
+
+def canonical_bind_host(value: Any) -> str:
+    """Canonicalize numeric bind aliases before applying exposure policy."""
+    host = str(value or "").strip().strip("[]")
+    if is_wildcard_host(host):
+        return "::" if ":" in host else "0.0.0.0"
+    try:
+        return socket.inet_ntoa(socket.inet_aton(host))
+    except OSError:
+        return host
+
+
+def safe_structured_identifier(value: Any) -> str:
+    """Return an identifier without ever retaining embedded secret material."""
+    text = str(value or "")
+    if re.fullmatch(
+        r"(?:task-[0-9a-f]{16}(?::(?:inbound|terminal):[A-Za-z-]+)?|ctx-[0-9a-f]{16})",
+        text,
+    ):
+        return text
+    if redact_public_text(text) == text:
+        return text
+    return "redacted-" + hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def validate_advertised_url(value: Any) -> str:
@@ -406,7 +470,9 @@ def resolve_bind_host(extra: Optional[Mapping[str, Any]] = None) -> str:
     Rule: numeric loopback unless the operator both configured an active named
     trusted-peer credential and explicitly requested a wider host.
     """
-    requested = str((extra or {}).get("host") or os.getenv("A2A_HOST", "")).strip()
+    requested = canonical_bind_host(
+        (extra or {}).get("host") or os.getenv("A2A_HOST", "")
+    )
     requested = requested or "127.0.0.1"
     loopback = {"127.0.0.1", "localhost", "::1"}
     if requested in loopback:
@@ -576,6 +642,7 @@ def _locked_audit_records(fd: int) -> list[dict[str, Any]]:
 
 def audit_event_present(event_id: str) -> bool:
     """Return whether a parseable, durable unique sink record exists."""
+    event_id = safe_structured_identifier(event_id)
     if not event_id:
         return False
     path = _audit_path()
@@ -612,6 +679,7 @@ def audit(
     deliberately observable and must never silently downgrade task auditing.
     """
     try:
+        safe_event_id = safe_structured_identifier(event_id)
         rec = {
             "ts": time.time(),
             "direction": direction,  # "inbound" | "outbound"
@@ -619,10 +687,10 @@ def audit(
             "principal": redact_outbound(peer),
             "on_behalf_of": redact_outbound(on_behalf_of),
             "capability": redact_outbound(capability),
-            "task_id": task_id,
-            "request_id": request_id,
+            "task_id": safe_structured_identifier(task_id),
+            "request_id": safe_structured_identifier(request_id),
             "status": status,
-            "event_id": event_id,
+            "event_id": safe_event_id,
             # Prompt and reply bodies are intentionally never audit records.
             # A hash permits correlation without creating a second sensitive
             # data store alongside the Hermes conversation state.
@@ -643,7 +711,7 @@ def audit(
                 fcntl.flock(fd, fcntl.LOCK_EX)
                 os.fchmod(fd, 0o600)
                 records = _locked_audit_records(fd)
-                if event_id and any(rec.get("event_id") == event_id for rec in records):
+                if safe_event_id and any(rec.get("event_id") == safe_event_id for rec in records):
                     return True
                 os.lseek(fd, 0, os.SEEK_END)
                 written = 0

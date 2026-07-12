@@ -86,6 +86,19 @@ class _LeaseLost(RuntimeError):
 _SAFE_EXTERNAL_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
+def _safe_external_id(value: Any) -> bool:
+    if isinstance(value, str) and re.fullmatch(
+        r"(?:task-[0-9a-f]{16}|ctx-[0-9a-f]{16})", value
+    ):
+        return True
+    redaction_target = value[5:] if isinstance(value, str) and value.startswith("task-") else value
+    return (
+        isinstance(value, str)
+        and bool(_SAFE_EXTERNAL_ID.fullmatch(value))
+        and security.redact_public_text(redaction_target) == redaction_target
+    )
+
+
 def _default_agent_name(extra: Optional[dict] = None) -> str:
     name = str((extra or {}).get("agent_name") or os.getenv("A2A_AGENT_NAME", "")).strip()
     if name:
@@ -197,7 +210,7 @@ class A2AAdapter(BasePlatformAdapter):
         except ValueError as exc:
             self._advertised_url = ""
             self._config_error = self._config_error or str(exc)
-        if self.host in {"0.0.0.0", "::"} and not self._advertised_url:
+        if security.is_wildcard_host(self.host) and not self._advertised_url:
             self._config_error = self._config_error or (
                 "wildcard A2A bind requires an explicit valid advertised_url"
             )
@@ -484,6 +497,11 @@ class A2AAdapter(BasePlatformAdapter):
                     return
 
                 req_id = req.get("id")
+                if isinstance(req_id, str) and not _safe_external_id(req_id):
+                    self._json(400, protocol.jsonrpc_error(
+                        None, -32600, "request id contains forbidden credential material",
+                    ))
+                    return
                 method = req.get("method", "")
                 params = req.get("params", {}) or {}
                 requested_versions = self.headers.get_all("A2A-Version", failobj=[])
@@ -549,7 +567,7 @@ class A2AAdapter(BasePlatformAdapter):
                         self._json(403, protocol.jsonrpc_error(req_id, -32003, denial))
                         return
                     task_id = str(params.get("taskId") or params.get("id") or "").strip()
-                    if not _SAFE_EXTERNAL_ID.fullmatch(task_id):
+                    if not _safe_external_id(task_id):
                         self._json(400, protocol.jsonrpc_error(req_id, -32602, "valid task id is required"))
                         return
                     try:
@@ -576,7 +594,7 @@ class A2AAdapter(BasePlatformAdapter):
                         self._json(403, protocol.jsonrpc_error(req_id, -32003, denial))
                         return
                     task_id = str(params.get("taskId") or params.get("id") or "").strip()
-                    if not _SAFE_EXTERNAL_ID.fullmatch(task_id):
+                    if not _safe_external_id(task_id):
                         self._json(400, protocol.jsonrpc_error(req_id, -32602, "valid task id is required"))
                         return
                     try:
@@ -700,6 +718,9 @@ class A2AAdapter(BasePlatformAdapter):
     # ── Inbound task handling ─────────────────────────────────────────────
 
     def _request_policy(self, params: dict, identity: security.PeerIdentity):
+        config_error = security.validate_inbound_config(self.extra)
+        if config_error:
+            return None, f"invalid A2A policy: {config_error}"
         message = params.get("message", {}) or {}
         if message and not isinstance(message, dict):
             return None, "message must be an object"
@@ -735,7 +756,7 @@ class A2AAdapter(BasePlatformAdapter):
                     if not isinstance(raw_rules, dict):
                         continue
                     tool_rules[str(tool_name)] = {
-                        str(field): frozenset(values if isinstance(values, list) else [values])
+                        str(field): frozenset(values)
                         for field, values in raw_rules.items()
                     }
 
@@ -762,7 +783,7 @@ class A2AAdapter(BasePlatformAdapter):
         if not isinstance(value, str):
             return ""
         value = value.strip()
-        return value if _SAFE_EXTERNAL_ID.fullmatch(value) else ""
+        return value if _safe_external_id(value) else ""
 
     @staticmethod
     def _context_id(params: dict) -> str:
@@ -770,7 +791,7 @@ class A2AAdapter(BasePlatformAdapter):
         if not isinstance(message, dict):
             raise ValueError("message must be an object")
         value = message.get("contextId") or params.get("contextId") or ""
-        if value and (not isinstance(value, str) or not _SAFE_EXTERNAL_ID.fullmatch(value)):
+        if value and not _safe_external_id(value):
             raise ValueError("contextId must contain only letters, digits, '_' or '-'")
         return str(value or "")
 

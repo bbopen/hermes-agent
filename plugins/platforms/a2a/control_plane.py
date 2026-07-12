@@ -1063,9 +1063,11 @@ class TaskStore:
 
 def task_to_wire(task: dict[str, Any]) -> dict[str, Any]:
     """Convert durable task state into a stable supported A2A task shape."""
+    from .security import safe_structured_identifier
+
     wire = protocol.build_task(
-        str(task["task_id"]),
-        str(task["context_id"]),
+        safe_structured_identifier(task["task_id"]),
+        safe_structured_identifier(task["context_id"]),
         str(task["state"]),
         str(task.get("result_text") or ""),
         timestamp=float(task.get("updated_at") or task.get("created_at") or time.time()),

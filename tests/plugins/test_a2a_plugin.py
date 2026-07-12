@@ -116,6 +116,8 @@ class TestBearerAuth:
             {"trusted_peers": {"peer": {"on_behalf_of": ["brett"], "capabilities": {"proof": True}}}},
             {"capability_tools": {False: ["terminal"]}},
             {"capability_tools": {"proof": {"terminal": True}}},
+            {"capability_tool_rules": {"proof": {"terminal": {"action": "run"}}}},
+            {"capability_tool_rules": {"proof": {"terminal": False}}},
         ],
     )
     def test_nested_policy_schema_rejects_non_lists_and_non_string_keys(self, extra):
@@ -344,6 +346,23 @@ class TestAudit:
         records = tmp_path.joinpath("a2a_audit.jsonl").read_text().splitlines()
         assert len(records) == 1
         assert json.loads(records[0])["event_id"] == "task:terminal:completed"
+
+    def test_structured_identifiers_never_echo_embedded_secrets(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        secret = "joinedgithub_pat_11AA22bb33CC44dd55EE66ff77GG88hh"
+        assert security.audit(
+            "terminal", "peer", secret, "", request_id=secret, event_id=secret,
+        )
+        raw = tmp_path.joinpath("a2a_audit.jsonl").read_text()
+        assert secret not in raw
+        assert security.audit_event_present(secret) is True
+        wire = control_plane.task_to_wire({
+            "task_id": secret, "context_id": "joined" + "AIza" + "A" * 35,
+            "state": protocol.STATE_COMPLETED, "result_text": "done",
+            "created_at": time.time(), "updated_at": time.time(),
+        })
+        assert secret not in json.dumps(wire)
+        assert "AIza" not in json.dumps(wire)
 
     def test_cross_process_duplicate_event_is_one_durable_record(
         self, monkeypatch, tmp_path,
@@ -1185,6 +1204,14 @@ class TestReplyCapture:
             "capability_tools": {"proof": []},
         }))
         assert asyncio.run(missing.connect()) is False
+        zero = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "host": "0", "port": 0, "trusted_peers": {"peer": peer},
+            "capability_tools": {"proof": []},
+        }))
+        assert zero.host == "0.0.0.0"
+        assert asyncio.run(zero.connect()) is False
+        for alias in ("0", "0.0.0.0", "::", "[::]", "::ffff:0.0.0.0"):
+            assert security.is_wildcard_host(alias)
 
         valid = A2AAdapter(PlatformConfig(enabled=True, extra={
             "host": "0.0.0.0", "port": 0,
@@ -1778,6 +1805,25 @@ class TestPrincipalBoundTaskHTTP:
                 with pytest.raises(urllib.error.HTTPError) as rejected:
                     await asyncio.to_thread(
                         post, versioned, "token-a", "a-current", invalid_version,
+                    )
+                assert rejected.value.code == 400
+            identifier_secret = "joinedgithub_pat_11AA22bb33CC44dd55EE66ff77GG88hh"
+            for field in ("rpc_id", "message_id", "context_id"):
+                invalid_identifier = {
+                    "jsonrpc": "2.0", "id": "safe-id", "method": "message/send",
+                    "params": json.loads(json.dumps(valid_params)),
+                }
+                if field == "rpc_id":
+                    invalid_identifier["id"] = identifier_secret
+                elif field == "message_id":
+                    invalid_identifier["params"]["message"]["messageId"] = identifier_secret
+                else:
+                    invalid_identifier["params"]["message"]["contextId"] = (
+                        "joined" + "AIza" + "A" * 35
+                    )
+                with pytest.raises(urllib.error.HTTPError) as rejected:
+                    await asyncio.to_thread(
+                        post, invalid_identifier, "token-a", "a-current",
                     )
                 assert rejected.value.code == 400
             unsupported = {
