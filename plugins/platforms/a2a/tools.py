@@ -410,6 +410,10 @@ def _jsonrpc_response_error(response: Any) -> str:
     result = response["result"]
     if not isinstance(result, dict):
         return "result must be an object"
+    if set(result) - {"id", "contextId", "status", "artifacts", "metadata", "history", "kind"}:
+        return "result contains unknown fields"
+    if result.get("kind", "task") != "task":
+        return "result.kind must be task"
     for field in ("id", "contextId"):
         if field in result and not isinstance(result[field], str):
             return f"result.{field} must be a string"
@@ -417,6 +421,12 @@ def _jsonrpc_response_error(response: Any) -> str:
         status = result["status"]
         if not isinstance(status, dict) or not isinstance(status.get("state"), str):
             return "result.status.state must be a string"
+        if set(status) - {"state", "message", "timestamp"}:
+            return "result.status contains unknown fields"
+        if "timestamp" in status and (
+            not isinstance(status["timestamp"], str)
+        ):
+            return "result.status.timestamp must be a string"
         if status["state"] not in {
             "submitted", "working", "input-required", "completed", "failed", "canceled",
         }:
@@ -426,7 +436,12 @@ def _jsonrpc_response_error(response: Any) -> str:
     if "artifacts" in result and not isinstance(result["artifacts"], list):
         return "result.artifacts must be a list"
     for artifact in result.get("artifacts", []):
-        if not isinstance(artifact, dict) or _parts_schema_error(artifact.get("parts")):
+        if (
+            not isinstance(artifact, dict)
+            or set(artifact) - {"artifactId", "name", "description", "parts", "metadata"}
+            or not isinstance(artifact.get("artifactId"), str)
+            or _parts_schema_error(artifact.get("parts"))
+        ):
             return "result artifact is invalid"
     return ""
 
@@ -434,6 +449,8 @@ def _jsonrpc_response_error(response: Any) -> str:
 def _parts_schema_error(parts: Any) -> bool:
     return not isinstance(parts, list) or any(
         not isinstance(part, dict)
+        or set(part) - {"kind", "type", "text"}
+        or ("kind" in part) == ("type" in part)
         or part.get("kind", part.get("type")) != "text"
         or not isinstance(part.get("text"), str)
         for part in parts
@@ -443,7 +460,9 @@ def _parts_schema_error(parts: Any) -> bool:
 def _message_schema_error(message: Any) -> bool:
     return (
         not isinstance(message, dict)
+        or set(message) - {"role", "parts", "messageId", "contextId", "taskId", "metadata"}
         or message.get("role") not in {"user", "agent"}
+        or not isinstance(message.get("messageId"), str)
         or _parts_schema_error(message.get("parts"))
     )
 
@@ -451,10 +470,24 @@ def _message_schema_error(message: Any) -> bool:
 def _agent_card_error(card: Any) -> str:
     if not isinstance(card, dict):
         return "card must be an object"
+    allowed = {
+        "name", "description", "url", "version", "protocolVersion",
+        "capabilities", "defaultInputModes", "defaultOutputModes", "skills",
+        "securitySchemes", "security", "x-hermes-capabilities",
+    }
+    if set(card) - allowed:
+        return "card contains unknown fields"
     for field in ("name", "description", "url", "protocolVersion"):
         if not isinstance(card.get(field), str):
             return f"card.{field} must be a string"
     capabilities = card.get("capabilities")
+    parts = urlsplit(card["url"])
+    if (
+        parts.scheme not in {"http", "https"} or not parts.hostname
+        or parts.username is not None or parts.password is not None
+        or parts.query or parts.fragment or parts.path not in {"", "/"}
+    ):
+        return "card.url must be one canonical base origin"
     if not isinstance(capabilities, dict) or any(
         type(capabilities.get(field)) is not bool
         for field in ("streaming", "pushNotifications", "stateTransitionHistory")
@@ -717,8 +750,7 @@ def a2a_call(args: dict, **_: Any) -> str:
             return f"Error: peer '{agent}' rejected auth (HTTP {e.code}). Check the configured token."
         return f"Error: call to '{agent}' failed — HTTP {e.code}."
     except Exception as e:
-        try:
-            poll_body = {
+        poll_body = {
                 "jsonrpc": "2.0",
                 "id": protocol.new_task_id(),
                 "method": "tasks/getByRequest",
@@ -729,14 +761,30 @@ def a2a_call(args: dict, **_: Any) -> str:
                         "capability": capability,
                     },
                 },
-            }
-            resp = _http_post_json(
-                rpc_url, poll_body, headers,
-                max(0.25, min(10.0, _remaining(request_deadline))),
-            )
-            rpc_body = poll_body
-        except Exception:
-            return f"Error: call to '{agent}' failed — {e}."
+        }
+        rpc_body = poll_body
+        while True:
+            try:
+                remaining = _remaining(request_deadline)
+                resp = _http_post_json(
+                    rpc_url, poll_body, headers, min(10.0, remaining),
+                )
+                response_error = _jsonrpc_response_error(resp)
+                if response_error or resp.get("id") != poll_body["id"]:
+                    raise ValueError(response_error or "mismatched response id")
+                result = resp.get("result")
+                state = (result.get("status") or {}).get("state") if isinstance(result, dict) else ""
+                if state in {"completed", "failed", "canceled", "input-required"}:
+                    break
+                time.sleep(min(0.25, max(0.0, _remaining(request_deadline))))
+            except TimeoutError:
+                return f"Error: call to '{agent}' failed — {e}."
+            except urllib.error.HTTPError as poll_error:
+                if poll_error.code != 404:
+                    return f"Error: call to '{agent}' failed — {e}."
+                time.sleep(min(0.25, max(0.0, _remaining(request_deadline))))
+            except Exception:
+                return f"Error: call to '{agent}' failed — {e}."
 
     response_error = _jsonrpc_response_error(resp)
     if response_error:
@@ -760,6 +808,8 @@ def a2a_call(args: dict, **_: Any) -> str:
     if state:
         header += f" · {state}"
     header += "]"
+    if not reply and state == "working":
+        reply = "(task still working; poll by request identity)"
     return f"{header}\n{reply or '(no text reply)'}"
 
 
@@ -795,6 +845,15 @@ def a2a_list(args: dict | None = None, **_: Any) -> str:
             if not entry or entry.get("error"):
                 reason = (entry or {}).get("error", "invalid peer")
                 return f"Error: invalid A2A peer configuration — {reason}."
+            try:
+                _validate_peer_url(
+                    entry["url"],
+                    expected_origin=_origin(entry["url"]),
+                    allow_configured_non_public=True,
+                )
+                _pinned_addresses(entry["url"], time.monotonic() + 5.0)
+            except Exception:
+                return "Error: invalid A2A peer configuration — peer URL is unsafe or unresolved."
             auth = entry["auth"].get("type", "none")
             lines.append(
                 f"  - {security.redact_public_text(name)}: "

@@ -491,14 +491,23 @@ class TaskStore:
 
     def get_task_by_request(
         self, request_key: str, *, principal: str, on_behalf_of: str, capability: str,
+        expected_payload_sha256: str = "",
     ) -> Optional[dict[str, Any]]:
         conn = self._connect()
         try:
             row = conn.execute(
-                """SELECT tasks.* FROM requests JOIN tasks USING(task_id)
+                """SELECT tasks.* FROM requests JOIN tasks
+                     ON requests.task_id = tasks.task_id
+                    AND requests.principal = tasks.principal
+                    AND requests.on_behalf_of = tasks.on_behalf_of
+                    AND requests.payload_sha256 = tasks.payload_sha256
                    WHERE requests.principal = ? AND requests.on_behalf_of = ?
-                     AND requests.request_key = ? AND tasks.capability = ?""",
-                (principal, on_behalf_of, request_key, capability),
+                     AND requests.request_key = ? AND tasks.capability = ?
+                     AND (? = '' OR requests.payload_sha256 = ?)""",
+                (
+                    principal, on_behalf_of, request_key, capability,
+                    expected_payload_sha256, expected_payload_sha256,
+                ),
             ).fetchone()
             return _row_to_dict(row)
         finally:

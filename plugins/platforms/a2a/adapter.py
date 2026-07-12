@@ -447,6 +447,7 @@ class A2AAdapter(BasePlatformAdapter):
                 logger.debug("A2A http: " + format, *args)
 
             def _json(self, code: int, payload: dict):
+                self._a2a_response_started = True
                 body = json.dumps(payload).encode("utf-8")
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
@@ -467,7 +468,7 @@ class A2AAdapter(BasePlatformAdapter):
                     return
                 self._json(404, {"error": "not found"})
 
-            def do_POST(self):  # noqa: N802
+            def _do_POST(self):
                 content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
                 if content_type != "application/json":
                     self._json(415, protocol.jsonrpc_error(None, -32600, "Content-Type must be application/json"))
@@ -631,6 +632,9 @@ class A2AAdapter(BasePlatformAdapter):
                         principal=policy.principal,
                         on_behalf_of=policy.on_behalf_of,
                         capability=policy.capability,
+                        expected_payload_sha256=str(
+                            params.get("payloadSha256") or ""
+                        ),
                     )
                     if task is None:
                         self._json(404, protocol.jsonrpc_error(
@@ -665,6 +669,17 @@ class A2AAdapter(BasePlatformAdapter):
                     self._json(200, protocol.jsonrpc_result(req_id, task_to_wire(task)))
                     return
                 self._json(200, protocol.jsonrpc_error(req_id, -32601, f"method not found: {method}"))
+
+            def do_POST(self):  # noqa: N802
+                self._a2a_response_started = False
+                try:
+                    self._do_POST()
+                except Exception:
+                    logger.error("A2A: durable request failed", exc_info=True)
+                    if not self._a2a_response_started:
+                        self._json(500, protocol.jsonrpc_error(
+                            None, -32010, "durable task state is unavailable",
+                        ))
 
         try:
             self._httpd = _BoundedThreadingHTTPServer(
@@ -1037,10 +1052,20 @@ class A2AAdapter(BasePlatformAdapter):
         # change behavior under an existing message identity.
         payload = {
             "method": method,
-            "params": params,
+            "params": {
+                key: value for key, value in params.items() if key != "deadline"
+            },
             "effectiveContextId": requested_context_id,
-            "effectiveDeadline": deadline_at,
         }
+        message_payload = payload["params"].get("message")
+        if isinstance(message_payload, dict):
+            message_payload = dict(message_payload)
+            metadata_payload = message_payload.get("metadata")
+            if isinstance(metadata_payload, dict):
+                metadata_payload = dict(metadata_payload)
+                metadata_payload.pop("deadline", None)
+                message_payload["metadata"] = metadata_payload
+            payload["params"]["message"] = message_payload
         self._reconcile_durable_tasks()
         task, created = self._tasks.claim_request(
             principal=policy.principal,

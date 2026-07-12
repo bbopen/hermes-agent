@@ -2064,7 +2064,6 @@ class TestPrincipalBoundTaskHTTP:
             changed_envelopes.append(changed)
             for field, value in (
                 ("contextId", "ctx-other"),
-                ("deadline", time.time() + 60),
                 ("configuration", {"blocking": True}),
             ):
                 changed = json.loads(json.dumps(body))
@@ -2074,6 +2073,12 @@ class TestPrincipalBoundTaskHTTP:
                 with pytest.raises(urllib.error.HTTPError) as conflict:
                     await asyncio.to_thread(post, changed, "token-a", "a-current")
                 assert conflict.value.code == 409
+            retry_with_later_transport_deadline = json.loads(json.dumps(body))
+            retry_with_later_transport_deadline["params"]["deadline"] = time.time() + 60
+            retried = await asyncio.to_thread(
+                post, retry_with_later_transport_deadline, "token-a", "a-current",
+            )
+            assert retried["result"] == task
 
             stream = json.loads(json.dumps(body))
             stream["id"] = "stream"
