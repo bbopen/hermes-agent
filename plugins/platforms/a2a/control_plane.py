@@ -491,7 +491,7 @@ class TaskStore:
 
     def get_task_by_request(
         self, request_key: str, *, principal: str, on_behalf_of: str, capability: str,
-        expected_payload_sha256: str = "",
+        expected_payload_sha256: str,
     ) -> Optional[dict[str, Any]]:
         conn = self._connect()
         try:
@@ -504,10 +504,10 @@ class TaskStore:
                     AND requests.payload_sha256 = tasks.payload_sha256
                    WHERE requests.principal = ? AND requests.on_behalf_of = ?
                      AND requests.request_key = ? AND tasks.capability = ?
-                     AND (? = '' OR requests.payload_sha256 = ?)""",
+                     AND requests.payload_sha256 = ?""",
                 (
                     principal, on_behalf_of, request_key, capability,
-                    expected_payload_sha256, expected_payload_sha256,
+                    expected_payload_sha256,
                 ),
             ).fetchone()
             return _row_to_dict(row)

@@ -627,14 +627,18 @@ class A2AAdapter(BasePlatformAdapter):
                             req_id, -32602, "valid requestId is required",
                         ))
                         return
+                    payload_sha256 = str(params.get("payloadSha256") or "").strip()
+                    if not re.fullmatch(r"[0-9a-f]{64}", payload_sha256):
+                        self._json(400, protocol.jsonrpc_error(
+                            req_id, -32602, "valid payloadSha256 is required",
+                        ))
+                        return
                     task = adapter._tasks.get_task_by_request(
                         request_key,
                         principal=policy.principal,
                         on_behalf_of=policy.on_behalf_of,
                         capability=policy.capability,
-                        expected_payload_sha256=str(
-                            params.get("payloadSha256") or ""
-                        ),
+                        expected_payload_sha256=payload_sha256,
                     )
                     if task is None:
                         self._json(404, protocol.jsonrpc_error(

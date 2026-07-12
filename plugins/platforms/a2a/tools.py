@@ -67,6 +67,12 @@ def _remaining(deadline: float) -> float:
     return remaining
 
 
+def _host_authority(url: str, host: str, port: int) -> str:
+    display_host = f"[{host}]" if ":" in host else host
+    default_port = 443 if urlsplit(url).scheme == "https" else 80
+    return display_host if port == default_port else f"{display_host}:{port}"
+
+
 def _resolve_addresses(host: str, port: int, deadline: float):
     """Bound blocking getaddrinfo with a daemon resolver handoff."""
     result: queue.Queue = queue.Queue(maxsize=1)
@@ -188,9 +194,8 @@ def _pinned_json_request(
             context = ssl.create_default_context()
             sock = context.wrap_socket(sock, server_hostname=host)
             sock.settimeout(_remaining(deadline))
-        display_host = f"[{host}]" if ":" in host else host
         request_headers = {
-            "Host": display_host if port in (80, 443) else f"{display_host}:{port}",
+            "Host": _host_authority(url, host, port),
             "Connection": "close",
             **headers,
         }
@@ -432,8 +437,10 @@ def _jsonrpc_response_error(response: Any) -> str:
     if result.get("kind", "task") != "task":
         return "result.kind must be task"
     for field in ("id", "contextId"):
-        if field in result and not isinstance(result[field], str):
-            return f"result.{field} must be a string"
+        if not _valid_wire_identifier(result.get(field)):
+            return f"result.{field} must be a non-empty safe string"
+    if "metadata" in result and not _valid_json_metadata(result["metadata"]):
+        return "result.metadata must be a finite JSON object"
     if "status" in result:
         status = result["status"]
         if not isinstance(status, dict) or not isinstance(status.get("state"), str):
@@ -457,11 +464,16 @@ def _jsonrpc_response_error(response: Any) -> str:
             not isinstance(artifact, dict)
             or set(artifact) - {"artifactId", "name", "description", "parts", "metadata"}
             or not isinstance(artifact.get("artifactId"), str)
+            or not artifact.get("artifactId")
             or _parts_schema_error(artifact.get("parts"))
         ):
             return "result artifact is invalid"
         if "name" in artifact and not isinstance(artifact["name"], str):
             return "result artifact name must be a string"
+        if "description" in artifact and not isinstance(artifact["description"], str):
+            return "result artifact description must be a string"
+        if "metadata" in artifact and not _valid_json_metadata(artifact["metadata"]):
+            return "result artifact metadata must be a finite JSON object"
     history = result.get("history", [])
     if not isinstance(history, list) or any(_message_schema_error(item) for item in history):
         return "result history must contain messages"
@@ -483,6 +495,22 @@ def _json_value_error(value: Any) -> bool:
     return True
 
 
+def _valid_json_metadata(value: Any) -> bool:
+    return isinstance(value, dict) and not _json_value_error(value)
+
+
+def _valid_wire_identifier(value: Any) -> bool:
+    if isinstance(value, str) and re.fullmatch(
+        r"(?:task-[0-9a-f]{16}(?:-status)?|ctx-[0-9a-f]{16})", value
+    ):
+        return True
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and security.redact_public_text(value) == value
+    )
+
+
 def _parts_schema_error(parts: Any) -> bool:
     return not isinstance(parts, list) or any(
         not isinstance(part, dict)
@@ -499,7 +527,15 @@ def _message_schema_error(message: Any) -> bool:
         not isinstance(message, dict)
         or set(message) - {"role", "parts", "messageId", "contextId", "taskId", "metadata"}
         or message.get("role") not in {"user", "agent"}
-        or not isinstance(message.get("messageId"), str)
+        or not _valid_wire_identifier(message.get("messageId"))
+        or any(
+            field in message and not _valid_wire_identifier(message[field])
+            for field in ("contextId", "taskId")
+        )
+        or (
+            "metadata" in message
+            and not _valid_json_metadata(message["metadata"])
+        )
         or _parts_schema_error(message.get("parts"))
     )
 

@@ -947,6 +947,18 @@ class TestClientTools:
             "result": {"status": {"state": 7}, "artifacts": {}},
         }
         assert tools._jsonrpc_response_error(malformed_task)
+        empty_identity = {
+            "jsonrpc": "2.0", "id": "x",
+            "result": {"kind": "task", "id": "", "contextId": "",
+                       "status": {"state": "working"}},
+        }
+        assert tools._jsonrpc_response_error(empty_identity)
+
+    def test_host_authority_uses_scheme_specific_default_port(self):
+        assert tools._host_authority("http://peer:443", "peer", 443) == "peer:443"
+        assert tools._host_authority("https://peer:80", "peer", 80) == "peer:80"
+        assert tools._host_authority("http://peer", "peer", 80) == "peer"
+        assert tools._host_authority("https://peer", "peer", 443) == "peer"
 
     @pytest.mark.parametrize(
         "url",
@@ -2010,7 +2022,12 @@ class TestPrincipalBoundTaskHTTP:
             lookup_body = {
                 "jsonrpc": "2.0", "id": "rpc-lookup",
                 "method": "tasks/getByRequest",
-                "params": {"requestId": message["messageId"], "metadata": metadata},
+                "params": {
+                    "requestId": message["messageId"], "metadata": metadata,
+                    "payloadSha256": adapter._tasks.get_task(
+                        task_id, enforce_capability=False,
+                    )["payload_sha256"],
+                },
             }
             looked_up = await asyncio.to_thread(
                 post, lookup_body, "token-a", "a-current",
@@ -2021,9 +2038,15 @@ class TestPrincipalBoundTaskHTTP:
             with pytest.raises(urllib.error.HTTPError) as wrong_hash:
                 await asyncio.to_thread(post, wrong_hash_lookup, "token-a", "a-current")
             assert wrong_hash.value.code == 404
+            missing_hash_lookup = json.loads(json.dumps(lookup_body))
+            missing_hash_lookup["params"].pop("payloadSha256")
+            with pytest.raises(urllib.error.HTTPError) as missing_hash:
+                await asyncio.to_thread(post, missing_hash_lookup, "token-a", "a-current")
+            assert missing_hash.value.code == 400
             assert TaskStore(adapter._tasks.path).get_task_by_request(
                 message["messageId"], principal="peer-a", on_behalf_of="brett",
                 capability="system.proof",
+                expected_payload_sha256=lookup_body["params"]["payloadSha256"],
             )["task_id"] == task_id
             with pytest.raises(urllib.error.HTTPError) as hidden_lookup:
                 await asyncio.to_thread(post, lookup_body, "token-b", "b-current")
