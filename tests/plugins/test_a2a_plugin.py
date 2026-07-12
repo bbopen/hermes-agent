@@ -1210,8 +1210,20 @@ class TestReplyCapture:
         }))
         assert zero.host == "0.0.0.0"
         assert asyncio.run(zero.connect()) is False
+        zero_advertised = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "host": "0", "port": 0, "advertised_url": "http://0:9900/",
+            "trusted_peers": {"peer": peer}, "capability_tools": {"proof": []},
+        }))
+        assert asyncio.run(zero_advertised.connect()) is False
         for alias in ("0", "0.0.0.0", "::", "[::]", "::ffff:0.0.0.0"):
             assert security.is_wildcard_host(alias)
+        for url in (
+            "http://0:9900/",
+            "http://0x0:9900/",
+            "http://[::ffff:0.0.0.0]:9900/",
+        ):
+            with pytest.raises(ValueError):
+                security.validate_advertised_url(url)
 
         valid = A2AAdapter(PlatformConfig(enabled=True, extra={
             "host": "0.0.0.0", "port": 0,

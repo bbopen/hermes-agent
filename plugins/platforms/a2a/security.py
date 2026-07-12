@@ -333,21 +333,39 @@ def validate_advertised_url(value: Any) -> str:
         raise ValueError("advertised_url contains credential-shaped content")
     try:
         parsed = urlsplit(raw)
+        hostname = parsed.hostname
         if (
             parsed.scheme not in {"http", "https"}
-            or not parsed.hostname
+            or not hostname
             or parsed.username is not None
             or parsed.password is not None
             or parsed.query
             or parsed.fragment
             or parsed.path not in {"", "/"}
-            or parsed.hostname in {"0.0.0.0", "::"}
         ):
             raise ValueError
-        _ = parsed.port
-        if parsed.scheme == "http":
+        port = parsed.port
+        try:
+            address = ipaddress.ip_address(hostname)
+            canonical_host = address.compressed
+        except ValueError:
             try:
-                address = ipaddress.ip_address(parsed.hostname)
+                canonical_host = socket.inet_ntoa(socket.inet_aton(hostname))
+                address = ipaddress.ip_address(canonical_host)
+            except OSError:
+                canonical_host = hostname
+                address = None
+        if address is not None and (
+            address.is_unspecified
+            or bool(
+                address.version == 6
+                and address.ipv4_mapped is not None
+                and address.ipv4_mapped.is_unspecified
+            )
+        ):
+            raise ValueError
+        if parsed.scheme == "http":
+            if address is not None:
                 safe_http = (
                     address.is_loopback
                     or address.is_private
@@ -356,8 +374,8 @@ def validate_advertised_url(value: Any) -> str:
                         and address in ipaddress.ip_network("100.64.0.0/10")
                     )
                 )
-            except ValueError:
-                hostname = parsed.hostname.lower()
+            else:
+                hostname = hostname.lower()
                 safe_http = (
                     hostname == "localhost"
                     or "." not in hostname
@@ -369,7 +387,9 @@ def validate_advertised_url(value: Any) -> str:
         raise ValueError(
             "advertised_url must be one exact non-wildcard origin; public DNS requires https"
         ) from exc
-    return raw.rstrip("/") + "/"
+    display_host = f"[{canonical_host}]" if ":" in canonical_host else canonical_host
+    authority = display_host if port is None else f"{display_host}:{port}"
+    return f"{parsed.scheme}://{authority}/"
 
 
 def _has_trusted_peer_config(extra: Mapping[str, Any]) -> bool:
