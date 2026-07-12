@@ -500,6 +500,7 @@ class TaskStore:
                      ON requests.task_id = tasks.task_id
                     AND requests.principal = tasks.principal
                     AND requests.on_behalf_of = tasks.on_behalf_of
+                    AND requests.request_key = tasks.request_key
                     AND requests.payload_sha256 = tasks.payload_sha256
                    WHERE requests.principal = ? AND requests.on_behalf_of = ?
                      AND requests.request_key = ? AND tasks.capability = ?

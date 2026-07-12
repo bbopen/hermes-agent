@@ -2016,6 +2016,11 @@ class TestPrincipalBoundTaskHTTP:
                 post, lookup_body, "token-a", "a-current",
             )
             assert looked_up["result"] == task
+            wrong_hash_lookup = json.loads(json.dumps(lookup_body))
+            wrong_hash_lookup["params"]["payloadSha256"] = "0" * 64
+            with pytest.raises(urllib.error.HTTPError) as wrong_hash:
+                await asyncio.to_thread(post, wrong_hash_lookup, "token-a", "a-current")
+            assert wrong_hash.value.code == 404
             assert TaskStore(adapter._tasks.path).get_task_by_request(
                 message["messageId"], principal="peer-a", on_behalf_of="brett",
                 capability="system.proof",
