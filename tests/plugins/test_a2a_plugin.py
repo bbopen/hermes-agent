@@ -1001,6 +1001,15 @@ class TestClientTools:
         params["message"]["contextId"] = "valid-id\n"
         with pytest.raises(ValueError):
             A2AAdapter._context_id(params)
+        assert A2AAdapter._request_key({"message": {"parts": []}}, 7) == ""
+        assert A2AAdapter._request_key({
+            "message": {"messageId": 0, "metadata": {"idempotencyKey": "valid-id"}},
+        }, "rpc") == ""
+        assert A2AAdapter._request_key({
+            "message": {"messageId": "one", "metadata": {"idempotencyKey": "two"}},
+        }, "rpc") == ""
+        assert A2AAdapter._task_id_param({"taskId": []}) == ""
+        assert A2AAdapter._task_id_param({"taskId": "one", "id": "two"}) == ""
 
     def test_bounded_json_rejects_surrogates_cycles_and_wide_fanout(self):
         assert tools._json_value_error({"bad": "\ud800"})
@@ -1009,6 +1018,7 @@ class TestClientTools:
         cyclic["self"] = cyclic
         assert tools._json_value_error(cyclic)
         assert tools._json_value_error([None] * 500_000)
+        assert tools._json_value_error({"escaped": "\x00" * 200_000})
 
     def test_agent_card_uses_bounded_json_validation(self):
         card = protocol.build_agent_card(
@@ -2074,6 +2084,16 @@ class TestPrincipalBoundTaskHTTP:
             task_id = task["id"]
             duplicate = await asyncio.to_thread(post, body, "token-a", "a-current")
             assert duplicate["result"] == task
+            numeric_rpc = json.loads(json.dumps(body))
+            numeric_rpc["id"] = 7
+            string_rpc = json.loads(json.dumps(body))
+            string_rpc["id"] = "7"
+            assert (await asyncio.to_thread(
+                post, numeric_rpc, "token-a", "a-current",
+            ))["result"] == task
+            assert (await asyncio.to_thread(
+                post, string_rpc, "token-a", "a-current",
+            ))["result"] == task
             assert calls == [task_id]
 
             get_body = {"jsonrpc": "2.0", "id": "rpc-get", "method": "tasks/get",
@@ -2161,7 +2181,9 @@ class TestPrincipalBoundTaskHTTP:
             for changed in changed_envelopes:
                 with pytest.raises(urllib.error.HTTPError) as conflict:
                     await asyncio.to_thread(post, changed, "token-a", "a-current")
-                assert conflict.value.code == 409
+                assert conflict.value.code == (
+                    400 if "contextId" in changed["params"] else 409
+                )
             retry_with_later_transport_deadline = json.loads(json.dumps(body))
             retry_with_later_transport_deadline["params"]["deadline"] = time.time() + 60
             retried = await asyncio.to_thread(

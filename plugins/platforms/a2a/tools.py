@@ -526,7 +526,17 @@ def _json_value_error(value: Any) -> bool:
                 stack.append((child, depth + 1))
             continue
         return True
-    return False
+    try:
+        encoded = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError, RecursionError):
+        return True
+    return len(encoded) > max_bytes
 
 
 def _valid_json_metadata(value: Any) -> bool:

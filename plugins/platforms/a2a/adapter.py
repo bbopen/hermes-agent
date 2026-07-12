@@ -594,8 +594,8 @@ class A2AAdapter(BasePlatformAdapter):
                     if denial:
                         self._json(403, protocol.jsonrpc_error(req_id, -32003, denial))
                         return
-                    task_id = params.get("taskId") or params.get("id") or ""
-                    if not _safe_external_id(task_id):
+                    task_id = adapter._task_id_param(params)
+                    if not task_id:
                         self._json(400, protocol.jsonrpc_error(req_id, -32602, "valid task id is required"))
                         return
                     try:
@@ -621,7 +621,7 @@ class A2AAdapter(BasePlatformAdapter):
                     if denial:
                         self._json(403, protocol.jsonrpc_error(req_id, -32003, denial))
                         return
-                    request_key = params.get("requestId") or ""
+                    request_key = params.get("requestId") if "requestId" in params else ""
                     if not _safe_external_id(request_key):
                         self._json(400, protocol.jsonrpc_error(
                             req_id, -32602, "valid requestId is required",
@@ -653,8 +653,8 @@ class A2AAdapter(BasePlatformAdapter):
                     if denial:
                         self._json(403, protocol.jsonrpc_error(req_id, -32003, denial))
                         return
-                    task_id = params.get("taskId") or params.get("id") or ""
-                    if not _safe_external_id(task_id):
+                    task_id = adapter._task_id_param(params)
+                    if not task_id:
                         self._json(400, protocol.jsonrpc_error(req_id, -32602, "valid task id is required"))
                         return
                     try:
@@ -845,30 +845,54 @@ class A2AAdapter(BasePlatformAdapter):
         message = params.get("message") or {}
         if not isinstance(message, dict):
             return ""
-        value = (
-            message.get("messageId")
-            or params.get("idempotencyKey")
-            or req_id
-        )
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            value = str(value)
-        if not isinstance(value, str):
+        metadata = message.get("metadata")
+        if metadata is None:
+            metadata = params.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        values = []
+        if "messageId" in message:
+            values.append(message["messageId"])
+        if "idempotencyKey" in metadata:
+            values.append(metadata["idempotencyKey"])
+        if not values or any(not isinstance(value, str) for value in values):
             return ""
+        if any(value != values[0] for value in values[1:]):
+            return ""
+        value = values[0]
         return value if _safe_external_id(value) else ""
+
+    @staticmethod
+    def _task_id_param(params: dict) -> str:
+        values = []
+        if "taskId" in params:
+            values.append(params["taskId"])
+        if "id" in params:
+            values.append(params["id"])
+        if not values or any(not isinstance(value, str) for value in values):
+            return ""
+        if any(value != values[0] for value in values[1:]):
+            return ""
+        return values[0] if _safe_external_id(values[0]) else ""
 
     @staticmethod
     def _context_id(params: dict) -> str:
         message = params.get("message") or {}
         if not isinstance(message, dict):
             raise ValueError("message must be an object")
-        value = message.get("contextId")
-        if value is None:
-            value = params.get("contextId")
-        if value is None:
-            value = ""
-        if value != "" and not _safe_external_id(value):
+        values = []
+        if "contextId" in message:
+            values.append(message["contextId"])
+        if "contextId" in params:
+            values.append(params["contextId"])
+        if not values:
+            return ""
+        if (
+            any(not isinstance(value, str) for value in values)
+            or any(value != values[0] for value in values[1:])
+            or not _safe_external_id(values[0])
+        ):
             raise ValueError("contextId must contain only letters, digits, '_' or '-'")
-        return value
+        return values[0]
 
     @staticmethod
     def _deadline(params: dict) -> Optional[float]:
