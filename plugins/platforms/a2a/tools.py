@@ -121,7 +121,7 @@ class _DeadlineSocketView:
 
 
 def _pinned_addresses(
-    url: str, deadline: Optional[float] = None,
+    url: str, deadline: Optional[float] = None, *, credentialed: bool = False,
 ) -> tuple[object, tuple, str, int, str]:
     """Resolve once, validate that address set, and return one connect target.
 
@@ -166,6 +166,14 @@ def _pinned_addresses(
         raise ValueError("unsafe peer address class is never permitted")
     if any(not address.is_global for address in parsed_addresses) and not allow_private:
         raise ValueError("private, loopback, link-local, or internal peer URLs require explicit configuration")
+    if credentialed and scheme == "http" and any(
+        address.is_global and not (
+            address.version == 4
+            and address in ipaddress.ip_network("100.64.0.0/10")
+        )
+        for address in parsed_addresses
+    ):
+        raise ValueError("bearer credentials require HTTPS for public peers")
     family, sockaddr = addresses[0]
     path = parts.path or "/"
     if parts.query:
@@ -185,7 +193,9 @@ def _pinned_json_request(
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("peer timeout must be a positive finite number")
     deadline = time.monotonic() + timeout
-    family, sockaddr, host, port, path = _pinned_addresses(url, deadline)
+    family, sockaddr, host, port, path = _pinned_addresses(
+        url, deadline, credentialed=bool(headers.get("Authorization")),
+    )
     sock = socket.socket(family, socket.SOCK_STREAM)
     try:
         sock.settimeout(_remaining(deadline))
@@ -254,6 +264,22 @@ def _origin(url: str) -> str:
     return f"{parts.scheme}://{host}:{port}"
 
 
+def _base_origin_url(url: str) -> str:
+    """Require an exact credential-free base origin, not an arbitrary URL."""
+    raw = str(url or "").strip()
+    parts = urlsplit(raw)
+    _origin(raw)
+    if (
+        parts.username is not None
+        or parts.password is not None
+        or parts.query
+        or parts.fragment
+        or parts.path not in {"", "/"}
+    ):
+        raise ValueError("peer URL must be one exact http(s) origin")
+    return raw.rstrip("/")
+
+
 def _is_non_public_host(host: str) -> bool:
     """Classify syntactically local destinations without resolving DNS.
 
@@ -285,6 +311,15 @@ def _validate_peer_url(
     if _is_non_public_host(host) and not allow_configured_non_public:
         raise ValueError("private, loopback, link-local, or internal peer URLs require explicit configuration")
     return actual_origin
+
+
+def _validate_bearer_transport(url: str, headers: dict, *, configured: bool) -> None:
+    """Never place a bearer credential on public cleartext HTTP."""
+    if not headers.get("Authorization") or urlsplit(url).scheme == "https":
+        return
+    host = urlsplit(url).hostname or ""
+    if not configured or not _is_non_public_host(host):
+        raise ValueError("bearer credentials require HTTPS for public peers")
 
 
 def _configured_origin_allowed(url: str, cfg: dict) -> bool:
@@ -322,7 +357,11 @@ def _load_config() -> dict:
 def _resolve_peer(agent: str) -> Optional[dict]:
     """Resolve a peer name to {url, auth, timeout}, or treat ``agent`` as a URL."""
     if agent.startswith("http://") or agent.startswith("https://"):
-        return {"url": agent, "auth": {}, "timeout": _DEFAULT_TIMEOUT, "configured": False}
+        try:
+            direct_url = _base_origin_url(agent)
+        except ValueError:
+            return {"error": "direct peer URL must be one exact http(s) origin"}
+        return {"url": direct_url, "auth": {}, "timeout": _DEFAULT_TIMEOUT, "configured": False}
     cfg = _load_config()
     peers = cfg.get("a2a_agents") or {}
     if not isinstance(peers, dict):
@@ -430,7 +469,10 @@ def _jsonrpc_response_error(response: Any) -> str:
     result = response["result"]
     if not isinstance(result, dict):
         return "result must be an object"
-    if set(result) - {"id", "contextId", "status", "artifacts", "metadata", "history", "kind"}:
+    if set(result) - {
+        "id", "contextId", "status", "artifacts", "metadata", "history", "kind",
+        "x-hermes-control",
+    }:
         return "result contains unknown fields"
     if not all(field in result for field in ("id", "contextId", "status")):
         return "task result requires id, contextId, and status"
@@ -476,6 +518,19 @@ def _jsonrpc_response_error(response: Any) -> str:
     history = result.get("history", [])
     if not isinstance(history, list) or any(_message_schema_error(item) for item in history):
         return "result history must contain messages"
+    control = result.get("x-hermes-control")
+    if control is not None:
+        if not isinstance(control, dict) or set(control) - {
+            "cancellation", "deadline", "execution",
+        }:
+            return "result.x-hermes-control is invalid"
+        allowed = {
+            "cancellation": {"requested"},
+            "deadline": {"exceeded"},
+            "execution": {"uncertain"},
+        }
+        if any(type(value) is not str or value not in allowed[key] for key, value in control.items()):
+            return "result.x-hermes-control is invalid"
     return ""
 
 
@@ -595,7 +650,13 @@ def _agent_card_error(card: Any) -> str:
     }
     if set(card) - allowed:
         return "card contains unknown fields"
-    for field in ("name", "description", "url", "protocolVersion"):
+    required = {
+        "name", "description", "url", "version", "protocolVersion",
+        "capabilities", "defaultInputModes", "defaultOutputModes", "skills",
+    }
+    if not required.issubset(card):
+        return "card is missing required fields"
+    for field in ("name", "description", "url", "version", "protocolVersion"):
         if not isinstance(card.get(field), str):
             return f"card.{field} must be a string"
     capabilities = card.get("capabilities")
@@ -607,16 +668,29 @@ def _agent_card_error(card: Any) -> str:
     ):
         return "card.url must be one canonical base origin"
     if not isinstance(capabilities, dict) or any(
+        field not in capabilities
+        for field in ("streaming", "pushNotifications", "stateTransitionHistory")
+    ) or set(capabilities) - {
+        "streaming", "pushNotifications", "stateTransitionHistory",
+    } or any(
         type(capabilities.get(field)) is not bool
         for field in ("streaming", "pushNotifications", "stateTransitionHistory")
     ):
         return "card.capabilities must contain boolean capability flags"
+    for field in ("defaultInputModes", "defaultOutputModes"):
+        modes = card.get(field)
+        if not isinstance(modes, list) or not modes or any(
+            not isinstance(mode, str) or not mode for mode in modes
+        ):
+            return f"card.{field} must be a non-empty list of strings"
     skills = card.get("skills")
     if not isinstance(skills, list):
         return "card.skills must be a list"
     for skill in skills:
         if not isinstance(skill, dict):
             return "card skill must be an object"
+        if set(skill) != {"id", "name", "description", "tags"}:
+            return "card skill contains unknown or missing fields"
         if any(not isinstance(skill.get(field), str) for field in ("id", "name", "description")):
             return "card skill id/name/description must be strings"
         if not isinstance(skill.get("tags"), list) or any(
@@ -626,6 +700,19 @@ def _agent_card_error(card: Any) -> str:
     grants = card.get("x-hermes-capabilities", [])
     if not isinstance(grants, list) or any(not isinstance(grant, str) for grant in grants):
         return "card grants must be strings"
+    schemes = card.get("securitySchemes")
+    security_reqs = card.get("security")
+    if (schemes is None) != (security_reqs is None):
+        return "card securitySchemes and security must appear together"
+    if schemes is not None:
+        if (
+            not isinstance(schemes, dict)
+            or set(schemes) != {"bearer"}
+            or schemes["bearer"] != {"type": "http", "scheme": "bearer"}
+        ):
+            return "card.securitySchemes is invalid"
+        if security_reqs != [{"bearer": []}]:
+            return "card.security is invalid"
     return ""
 
 
@@ -639,6 +726,25 @@ def _redact_untrusted_data(value: Any) -> Any:
             security.redact_public_text(str(key)): _redact_untrusted_data(item)
             for key, item in value.items()
         }
+    return value
+
+
+def _redact_peer_data(value: Any, headers: dict) -> Any:
+    """Remove both shaped secrets and the exact credential used for this peer."""
+    authorization = str(headers.get("Authorization") or "")
+    bearer = authorization.split(None, 1)[1] if authorization.lower().startswith("bearer ") else ""
+
+    def scrub(text: str) -> str:
+        if bearer:
+            text = text.replace(bearer, "[redacted]")
+        return security.redact_public_text(text)
+
+    if isinstance(value, str):
+        return scrub(value)
+    if isinstance(value, list):
+        return [_redact_peer_data(item, headers) for item in value]
+    if isinstance(value, dict):
+        return {scrub(str(key)): _redact_peer_data(item, headers) for key, item in value.items()}
     return value
 
 
@@ -679,6 +785,7 @@ def a2a_discover(args: dict, **_: Any) -> str:
         return "Error: 'url' is required (e.g. http://localhost:9999)."
     cfg = _load_config()
     try:
+        url = _base_origin_url(url)
         origin = _origin(url)
         allow_private = _configured_origin_allowed(url, cfg)
         _validate_peer_url(
@@ -689,9 +796,9 @@ def a2a_discover(args: dict, **_: Any) -> str:
     try:
         card = _http_get_json(_card_url(url), {}, _DEFAULT_TIMEOUT)
     except urllib.error.HTTPError as e:
-        return f"Error: discovery failed — HTTP {e.code} from {url}."
-    except Exception as e:
-        return f"Error: could not reach {url} — {e}."
+        return f"Error: discovery failed — HTTP {e.code}."
+    except Exception:
+        return "Error: discovery failed — peer could not be reached safely."
 
     if not isinstance(card, dict):
         return "Error: peer returned an invalid Agent Card."
@@ -770,6 +877,12 @@ def a2a_call(args: dict, **_: Any) -> str:
         }
     except ValueError as exc:
         return f"Error: invalid A2A peer configuration — {exc}."
+    try:
+        _validate_bearer_transport(
+            base_url, headers, configured=bool(peer.get("configured")),
+        )
+    except ValueError as exc:
+        return f"Error: unsafe peer URL — {exc}."
     try:
         timeout = float(peer["timeout"])
     except (TypeError, ValueError):
@@ -852,6 +965,9 @@ def a2a_call(args: dict, **_: Any) -> str:
             expected_origin=peer_origin,
             allow_configured_non_public=bool(peer.get("configured")),
         )
+        _validate_bearer_transport(
+            rpc_url, headers, configured=bool(peer.get("configured")),
+        )
     except ValueError as e:
         return f"Error: peer '{agent}' Agent Card was rejected — {e}."
     if card is not None:
@@ -864,6 +980,7 @@ def a2a_call(args: dict, **_: Any) -> str:
             f"{card.get('protocolVersion')!r}."
         )
 
+    unknown_outcome: Optional[Exception] = None
     try:
         peer_remaining = _remaining(request_deadline)
     except TimeoutError:
@@ -880,8 +997,13 @@ def a2a_call(args: dict, **_: Any) -> str:
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
             return f"Error: peer '{agent}' rejected auth (HTTP {e.code}). Check the configured token."
-        return f"Error: call to '{agent}' failed — HTTP {e.code}."
+        if e.code < 500:
+            return f"Error: call to '{agent}' failed — HTTP {e.code}."
+        unknown_outcome = e
     except Exception as e:
+        unknown_outcome = e
+
+    if unknown_outcome is not None:
         poll_body = {
                 "jsonrpc": "2.0",
                 "id": protocol.new_task_id(),
@@ -911,13 +1033,29 @@ def a2a_call(args: dict, **_: Any) -> str:
                     break
                 time.sleep(min(0.25, max(0.0, _remaining(request_deadline))))
             except TimeoutError:
-                return f"Error: call to '{agent}' failed — {e}."
+                return (
+                    f"Error: outcome of request {request_identity} to '{agent}' is unknown; "
+                    "the durable lookup deadline expired."
+                )
             except urllib.error.HTTPError as poll_error:
                 if poll_error.code != 404:
-                    return f"Error: call to '{agent}' failed — {e}."
-                time.sleep(min(0.25, max(0.0, _remaining(request_deadline))))
+                    return (
+                        f"Error: outcome of request {request_identity} to '{agent}' is unknown; "
+                        f"durable lookup failed with HTTP {poll_error.code}."
+                    )
+                try:
+                    delay = min(0.25, max(0.0, _remaining(request_deadline)))
+                except TimeoutError:
+                    return (
+                        f"Error: outcome of request {request_identity} to '{agent}' is unknown; "
+                        "the durable lookup deadline expired."
+                    )
+                time.sleep(delay)
             except Exception:
-                return f"Error: call to '{agent}' failed — {e}."
+                return (
+                    f"Error: outcome of request {request_identity} to '{agent}' is unknown; "
+                    "durable lookup returned an invalid response."
+                )
 
     response_error = _jsonrpc_response_error(resp)
     if response_error:
@@ -927,9 +1065,10 @@ def a2a_call(args: dict, **_: Any) -> str:
 
     if "error" in resp:
         err = resp["error"]
-        return f"Peer '{agent}' returned an error: {err.get('message', err)}"
+        safe_err = _redact_peer_data(err, headers)
+        return f"Peer '{agent}' returned an error: {safe_err.get('message', safe_err)}"
 
-    result = resp.get("result", {})
+    result = _redact_peer_data(resp.get("result", {}), headers)
     reply = _reply_text_from_result(result)
     reply_ctx = result.get("contextId", ctx) if isinstance(result, dict) else ctx
     protocol.persist_message(reply_ctx, "agent", reply, rpc_body["id"])

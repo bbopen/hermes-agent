@@ -370,7 +370,7 @@ def safe_structured_identifier(value: Any) -> str:
 
 def validate_advertised_url(value: Any) -> str:
     """Validate one explicit public origin; return its normalized URL."""
-    raw = str(value or "").strip()
+    raw = unicodedata.normalize("NFKC", str(value or "").strip())
     if not raw:
         return ""
     if redact_public_text(raw) != raw:
@@ -392,6 +392,11 @@ def validate_advertised_url(value: Any) -> str:
         if "%" in hostname:
             raise ValueError
         decoded_host = unicodedata.normalize("NFKC", unquote(hostname))
+        if "%" in decoded_host or decoded_host != hostname:
+            # Percent escapes (including full-width percent aliases) make the
+            # authority parser and the address classifier disagree. A host
+            # never needs them, so fail closed rather than canonicalizing.
+            raise ValueError
         if any(char.isspace() for char in decoded_host):
             raise ValueError
         hostname = decoded_host.encode("idna").decode("ascii")
@@ -778,10 +783,9 @@ def audit(
         payload = (json.dumps(rec, ensure_ascii=False) + "\n").encode("utf-8")
         with _AUDIT_LOCK:
             path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                os.chmod(path.parent, 0o700)
-            except OSError:
-                pass
+            # The profile root is shared by the rest of Hermes and may
+            # intentionally be 0701/2770. Audit owns only its file; changing
+            # the global HERMES_HOME mode here is an authority violation.
             fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX)

@@ -53,13 +53,15 @@ Peers resolved from `config.yaml` → `a2a_agents`, or a direct URL.
   override patterns → `[filtered]`) and framed with a privacy prefix marking it
   untrusted peer input.
 - **Outbound redaction:** credential-shaped strings (`sk-…`, `ghp_…`, JWTs,
-  bearer tokens, emails) scrubbed before anything leaves.
+  bearer tokens, emails) plus the exact peer bearer used for the call are
+  scrubbed before untrusted peer data reaches output or persistence.
 - **Audit log:** profile-scoped append-only `a2a_audit.jsonl`; pending delivery
   is retained in a claimable SQLite outbox and retried without two live
   instances delivering the same claim concurrently.
 - **Transport:** outbound DNS validation and the actual TCP connect share the
   same resolved socket address. Redirects and cross-origin Agent Cards are
-  rejected before credentials can be forwarded.
+  rejected before credentials can be forwarded. Credentialed public peers
+  require HTTPS; configured private/tailnet peers may use HTTP.
 
 ## Persistence (survives compaction)
 A2A conversations are written beneath the active profile at

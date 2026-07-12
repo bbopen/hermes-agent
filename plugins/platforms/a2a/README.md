@@ -37,7 +37,7 @@ gateway:
 # peers you want to call (outbound):
 a2a_agents:
   worker:
-    url: "http://worker.example:9900"
+    url: "http://hms-m1:9900"
     auth:
       type: bearer
       key_id: "primary-2026-07"
@@ -98,6 +98,16 @@ an absent task.
   or `::`, set `advertised_url` to the exact `http(s)` origin peers use (for
   example a tailnet hostname). Userinfo, query strings, fragments, paths, and
   wildcard hosts are rejected; the client still pins RPC calls to that origin.
+- **Bearer credentials never cross public cleartext HTTP.** Explicitly
+  configured private/tailnet origins may use HTTP; public origins require
+  HTTPS. The resolved address set is checked again before the credentialed
+  socket is opened.
+- **Discovery accepts only a base origin.** Paths, userinfo, query strings, and
+  fragments are rejected before transport and are never reflected in output.
+- **Unknown submission outcomes are looked up, not replayed.** After a network
+  failure or HTTP 5xx, the built-in client polls `tasks/getByRequest` with the
+  stable request identity and canonical payload hash until it obtains the one
+  durable result or reaches the caller's deadline.
 - Inbound text is run through prompt-injection filters and framed as untrusted
   peer input.
 - Outbound text is scrubbed of credential-shaped strings.

@@ -69,6 +69,10 @@ _DEFAULT_PORT = 9900
 _REPLY_TIMEOUT = 300  # seconds to wait for the agent to answer an inbound task
 _DEFAULT_MAX_REQUEST_BYTES = 128 * 1024
 _DEFAULT_MAX_INFLIGHT_REQUESTS = 16
+_MAX_RESPONSE_BYTES = 512 * 1024
+_MAX_RESULT_TEXT_BYTES = 480 * 1024
+_MAX_JSON_NODES = 10_000
+_MAX_JSON_DEPTH = 64
 
 
 class _AgentShuttingDown(RuntimeError):
@@ -100,11 +104,157 @@ def _safe_external_id(value: Any) -> bool:
 
 
 def _valid_jsonrpc_id(value: Any) -> bool:
-    return (
-        value is None
-        or isinstance(value, str)
-        or type(value) in {int, float} and math.isfinite(value)
-    )
+    if value is None or isinstance(value, str):
+        return True
+    if type(value) is int:
+        return -(2**53 - 1) <= value <= 2**53 - 1
+    return type(value) is float and math.isfinite(value)
+
+
+def _parse_json_int(value: str) -> int:
+    if len(value.lstrip("-")) > 16:
+        raise ValueError("JSON integer is out of range")
+    parsed = int(value)
+    if not _valid_jsonrpc_id(parsed):
+        raise ValueError("JSON integer is out of range")
+    return parsed
+
+
+def _parse_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("JSON number must be finite")
+    return parsed
+
+
+def _bounded_json_error(value: Any) -> str:
+    """Validate a finite JSON tree without recursion or coercion."""
+    nodes = 0
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    while stack:
+        item, depth = stack.pop()
+        nodes += 1
+        if nodes > _MAX_JSON_NODES or depth > _MAX_JSON_DEPTH:
+            return "request exceeds bounded JSON limits"
+        if item is None or type(item) in {bool, int}:
+            continue
+        if type(item) is float:
+            if not math.isfinite(item):
+                return "request contains a non-finite number"
+            continue
+        if isinstance(item, str):
+            try:
+                item.encode("utf-8")
+            except UnicodeError:
+                return "request contains invalid Unicode"
+            continue
+        if isinstance(item, list):
+            if len(item) > _MAX_JSON_NODES - nodes - len(stack):
+                return "request exceeds bounded JSON limits"
+            stack.extend((child, depth + 1) for child in item)
+            continue
+        if isinstance(item, dict):
+            if len(item) > _MAX_JSON_NODES - nodes - len(stack):
+                return "request exceeds bounded JSON limits"
+            for key, child in item.items():
+                if not isinstance(key, str):
+                    return "request object keys must be strings"
+                stack.append((child, depth + 1))
+            continue
+        return "request contains a non-JSON value"
+    return ""
+
+
+def _metadata_schema_error(metadata: Any) -> str:
+    if not isinstance(metadata, dict):
+        return "metadata must be an object"
+    allowed = {"on_behalf_of", "capability", "idempotencyKey", "deadline"}
+    if set(metadata) - allowed:
+        return "metadata contains unknown fields"
+    for field in ("on_behalf_of", "capability", "idempotencyKey"):
+        if field in metadata and not isinstance(metadata[field], str):
+            return f"metadata.{field} must be a string"
+    return ""
+
+
+def _message_schema_error(message: Any) -> str:
+    if not isinstance(message, dict):
+        return "message must be an object"
+    allowed = {"role", "parts", "messageId", "contextId", "taskId", "metadata"}
+    if set(message) - allowed:
+        return "message contains unknown fields"
+    if message.get("role") != "user":
+        return "message.role must be 'user'"
+    if "messageId" in message and not _safe_external_id(message.get("messageId")):
+        return "message.messageId must be a safe non-empty string"
+    for field in ("contextId", "taskId"):
+        if field in message and not _safe_external_id(message[field]):
+            return f"message.{field} must be a safe string"
+    if "metadata" in message:
+        error = _metadata_schema_error(message["metadata"])
+        if error:
+            return error
+    parts = message.get("parts")
+    if not isinstance(parts, list) or not parts or len(parts) > 64:
+        return "message.parts must be a non-empty bounded list"
+    for part in parts:
+        if (
+            not isinstance(part, dict)
+            or set(part) != {"kind", "text"}
+            or part.get("kind") != "text"
+            or not isinstance(part.get("text"), str)
+        ):
+            return "message parts must be exact text Part objects"
+    return ""
+
+
+def _params_schema_error(method: str, params: Any) -> str:
+    if not isinstance(params, dict):
+        return "params must be an object"
+    metadata = params.get("metadata")
+    if metadata is not None:
+        error = _metadata_schema_error(metadata)
+        if error:
+            return error
+    if method == "message/send":
+        allowed = {
+            "message", "idempotencyKey", "contextId", "metadata", "deadline",
+            "configuration",
+        }
+        if set(params) - allowed:
+            return "message/send params contain unknown fields"
+        error = _message_schema_error(params.get("message"))
+        if error:
+            return error
+        if "idempotencyKey" in params and not isinstance(params["idempotencyKey"], str):
+            return "idempotencyKey must be a string"
+        if "contextId" in params and not _safe_external_id(params["contextId"]):
+            return "contextId must be a safe string"
+        configuration = params.get("configuration")
+        if configuration is not None:
+            if not isinstance(configuration, dict) or set(configuration) - {
+                "blocking", "acceptedOutputModes", "historyLength",
+            }:
+                return "configuration contains unsupported fields"
+            if "blocking" in configuration and type(configuration["blocking"]) is not bool:
+                return "configuration.blocking must be boolean"
+            modes = configuration.get("acceptedOutputModes")
+            if modes is not None and (
+                not isinstance(modes, list)
+                or any(not isinstance(mode, str) for mode in modes)
+            ):
+                return "configuration.acceptedOutputModes must contain strings"
+            history = configuration.get("historyLength")
+            if history is not None and (type(history) is not int or not 0 <= history <= 1000):
+                return "configuration.historyLength is out of range"
+        return ""
+    allowed_by_method = {
+        "tasks/get": {"taskId", "id", "metadata"},
+        "tasks/getByRequest": {"requestId", "payloadSha256", "metadata"},
+        "tasks/cancel": {"taskId", "id", "metadata"},
+    }
+    allowed = allowed_by_method.get(method, set())
+    return "" if not set(params) - allowed else f"{method} params contain unknown fields"
 
 
 def _default_agent_name(extra: Optional[dict] = None) -> str:
@@ -224,6 +374,15 @@ class A2AAdapter(BasePlatformAdapter):
             self._config_error = self._config_error or (
                 "wildcard A2A bind requires an explicit valid advertised_url"
             )
+        if not self._advertised_url and not security.is_wildcard_host(self.host):
+            try:
+                security.validate_advertised_url(
+                    f"http://{self.host}:{self.port}/"
+                )
+            except ValueError:
+                self._config_error = self._config_error or (
+                    "public A2A listeners require an explicit HTTPS advertised_url"
+                )
         self.agent_name = security.redact_public_text(_default_agent_name(extra))
         self.reply_timeout = _bounded_int(
             extra.get("reply_timeout", _REPLY_TIMEOUT),
@@ -447,8 +606,18 @@ class A2AAdapter(BasePlatformAdapter):
                 logger.debug("A2A http: " + format, *args)
 
             def _json(self, code: int, payload: dict):
+                body = json.dumps(
+                    payload, ensure_ascii=True, allow_nan=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                if len(body) > _MAX_RESPONSE_BYTES:
+                    code = 500
+                    body = json.dumps(protocol.jsonrpc_error(
+                        payload.get("id") if isinstance(payload, dict) else None,
+                        -32011,
+                        "A2A response exceeds the supported size limit",
+                    ), separators=(",", ":")).encode("utf-8")
                 self._a2a_response_started = True
-                body = json.dumps(payload).encode("utf-8")
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -469,14 +638,21 @@ class A2AAdapter(BasePlatformAdapter):
                 self._json(404, {"error": "not found"})
 
             def _do_POST(self):
+                if self.path != "/":
+                    self._json(404, protocol.jsonrpc_error(None, -32600, "POST path not found"))
+                    return
                 content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
                 if content_type != "application/json":
                     self._json(415, protocol.jsonrpc_error(None, -32600, "Content-Type must be application/json"))
                     return
-                raw_length = self.headers.get("Content-Length")
-                if raw_length is None:
+                raw_lengths = self.headers.get_all("Content-Length", failobj=[])
+                if not raw_lengths:
                     self._json(411, protocol.jsonrpc_error(None, -32600, "Content-Length is required"))
                     return
+                if len(raw_lengths) != 1:
+                    self._json(400, protocol.jsonrpc_error(None, -32600, "duplicate Content-Length is forbidden"))
+                    return
+                raw_length = raw_lengths[0]
                 try:
                     length = int(raw_length)
                 except (TypeError, ValueError):
@@ -488,9 +664,16 @@ class A2AAdapter(BasePlatformAdapter):
                     return
                 # Auth (only meaningful when a token is configured; otherwise
                 # we are localhost-only by construction).
+                auth_headers = self.headers.get_all("Authorization", failobj=[])
+                key_id_headers = self.headers.get_all("X-A2A-Key-Id", failobj=[])
+                if len(auth_headers) > 1 or len(key_id_headers) > 1:
+                    self._json(400, protocol.jsonrpc_error(
+                        None, -32600, "duplicate authentication headers are forbidden",
+                    ))
+                    return
                 identity = security.authenticate_bearer(
-                    self.headers.get("Authorization"), adapter.extra,
-                    self.headers.get("X-A2A-Key-Id"),
+                    auth_headers[0] if auth_headers else None, adapter.extra,
+                    key_id_headers[0] if key_id_headers else None,
                     local_request=security.is_loopback_address(self.client_address[0]),
                 )
                 if identity is None:
@@ -502,6 +685,8 @@ class A2AAdapter(BasePlatformAdapter):
                         raise ValueError("incomplete request body")
                     req = json.loads(
                         raw.decode("utf-8"),
+                        parse_int=_parse_json_int,
+                        parse_float=_parse_json_float,
                         parse_constant=lambda value: (_ for _ in ()).throw(
                             ValueError(f"invalid JSON constant: {value}")
                         ),
@@ -512,6 +697,17 @@ class A2AAdapter(BasePlatformAdapter):
 
                 if not isinstance(req, dict):
                     self._json(400, protocol.jsonrpc_error(None, -32600, "request must be an object"))
+                    return
+                bounded_error = _bounded_json_error(req)
+                if bounded_error:
+                    self._json(400, protocol.jsonrpc_error(None, -32600, bounded_error))
+                    return
+                if set(req) != {"jsonrpc", "id", "method", "params"}:
+                    self._json(400, protocol.jsonrpc_error(
+                        req.get("id") if _valid_jsonrpc_id(req.get("id")) else None,
+                        -32600,
+                        "JSON-RPC request contains unknown or missing fields",
+                    ))
                     return
 
                 req_id = req.get("id")
@@ -556,6 +752,10 @@ class A2AAdapter(BasePlatformAdapter):
                     self._json(200, protocol.jsonrpc_error(
                         req_id, -32601, f"method not found: {method}",
                     ))
+                    return
+                params_error = _params_schema_error(method, params)
+                if params_error:
+                    self._json(400, protocol.jsonrpc_error(req_id, -32602, params_error))
                     return
 
                 if method == "message/send":
@@ -743,18 +943,102 @@ class A2AAdapter(BasePlatformAdapter):
             except Exception:
                 pass
             self._httpd = None
-        # Fail any in-flight replies so blocked HTTP threads don't hang.
+        # Stop gateway execution before releasing its capability policy. A
+        # disconnect is not permission to let an already-dispatched tool keep
+        # running unobserved. Unconfirmed executions retain their policy and
+        # process-local tracking so they still fail within the original grant.
         with self._pending_lock:
-            for fut in self._pending_replies.values():
-                if not fut.done():
+            active = list(self._active_tasks)
+        stopped: set[str] = set()
+        for task_id in active:
+            try:
+                current = self._tasks.get_task(task_id, enforce_capability=False)
+                if current is None or current["state"] in TERMINAL_STATES:
+                    stopped.add(task_id)
+                    continue
+                self._tasks.request_stop(
+                    task_id,
+                    reason="shutdown",
+                    backstop="gateway.cancel_session_processing",
+                )
+                with self._pending_lock:
+                    dispatch = self._dispatch_futures.get(task_id)
+                    session_key = self._active_session_keys.get(task_id)
+                if dispatch is not None and not dispatch.done():
+                    dispatch.cancel()
+                if session_key:
+                    await self.cancel_session_processing(session_key)
+                await asyncio.sleep(0)
+                session_task = self._session_tasks.get(session_key) if session_key else None
+                execution_stopped = (
+                    (dispatch is None or dispatch.done())
+                    and (session_task is None or session_task.done())
+                )
+                current = self._tasks.get_task(task_id, enforce_capability=False) or current
+                if execution_stopped:
+                    try:
+                        self._tasks.confirm_execution_stopped(
+                            task_id,
+                            terminal_state=protocol.STATE_FAILED,
+                            result_text="[task stopped because the A2A worker disconnected]",
+                            lease_owner=self._instance_id,
+                            incarnation=int(current["incarnation"]),
+                        )
+                    except InvalidTaskState:
+                        pass
+                    stopped.add(task_id)
+                else:
+                    self._tasks.mark_execution_uncertain(task_id, reason="shutdown-unconfirmed")
+            except Exception:
+                logger.warning(
+                    "A2A: could not prove task %s stopped during disconnect",
+                    task_id,
+                    exc_info=True,
+                )
+                try:
+                    self._tasks.mark_execution_uncertain(task_id, reason="shutdown-error")
+                except Exception:
+                    pass
+
+        # Release blocked HTTP handlers only after execution is proved stopped.
+        # Deactivation is now safe; their own finally block is idempotent.
+        stopped_contexts: dict[str, str] = {}
+        with self._pending_lock:
+            for task_id in stopped:
+                context_id = self._active_tasks.get(task_id)
+                if context_id:
+                    stopped_contexts[task_id] = context_id
+                fut = self._pending_replies.get(context_id) if context_id else None
+                if fut is not None and not fut.done():
                     fut.set_exception(_AgentShuttingDown("agent shutting down"))
-            self._pending_replies.clear()
-            self._pending_tasks.clear()
-            self._active_tasks.clear()
-            self._active_session_keys.clear()
-            self._dispatch_futures.clear()
-            self._lease_heartbeats.clear()
-            self._stream_buffers.clear()
+            # Non-task direct-send waiters have no execution to abandon.
+            active_contexts = set(self._active_tasks.values())
+            for context_id, fut in list(self._pending_replies.items()):
+                if context_id not in active_contexts:
+                    if not fut.done():
+                        fut.set_exception(_AgentShuttingDown("agent shutting down"))
+                    self._pending_replies.pop(context_id, None)
+                    self._pending_tasks.pop(context_id, None)
+                    self._stream_buffers.pop(context_id, None)
+            for task_id, context_id in stopped_contexts.items():
+                self._pending_replies.pop(context_id, None)
+                self._pending_tasks.pop(context_id, None)
+                self._active_tasks.pop(task_id, None)
+                self._active_session_keys.pop(task_id, None)
+                self._dispatch_futures.pop(task_id, None)
+                self._lease_heartbeats.pop(task_id, None)
+                self._stream_buffers.pop(context_id, None)
+        for context_id in stopped_contexts.values():
+            deactivate(context_id)
+        with self._pending_lock:
+            unconfirmed = {
+                task_id: self._active_tasks.get(task_id)
+                for task_id in active
+                if task_id not in stopped
+            }
+        for task_id, context_id in unconfirmed.items():
+            if context_id:
+                self._release_authority_when_execution_stops(task_id, context_id)
 
     # ── Agent Card ────────────────────────────────────────────────────────
 
@@ -796,7 +1080,17 @@ class A2AAdapter(BasePlatformAdapter):
         message = params.get("message", {}) or {}
         if message and not isinstance(message, dict):
             return None, "message must be an object"
-        metadata = message.get("metadata") or params.get("metadata") or {}
+        message_metadata = message.get("metadata") or {}
+        params_metadata = params.get("metadata") or {}
+        if message_metadata and params_metadata:
+            for field in ("on_behalf_of", "capability"):
+                if (
+                    field in message_metadata
+                    and field in params_metadata
+                    and message_metadata[field] != params_metadata[field]
+                ):
+                    return None, f"conflicting {field} claims"
+        metadata = message_metadata or params_metadata
         if not isinstance(metadata, dict):
             return None, "metadata must be an object"
         if not identity.legacy and (
@@ -971,6 +1265,46 @@ class A2AAdapter(BasePlatformAdapter):
             logger.warning("A2A: gateway cancellation backstop failed for task %s", task_id,
                            exc_info=True)
             return False
+
+    def _release_authority_when_execution_stops(
+        self, task_id: str, context_id: str,
+    ) -> None:
+        """Retain policy after an unconfirmed stop, then release it exactly once.
+
+        This watcher is deliberately process-local and daemonized. A live
+        execution must keep its original capability grant even after its HTTP
+        request or listener has gone away; a missing policy would fail closed
+        for new tools but can strand already-entered tool work outside the
+        provenance record.
+        """
+        def watch() -> None:
+            while True:
+                with self._pending_lock:
+                    dispatch = self._dispatch_futures.get(task_id)
+                    session_key = self._active_session_keys.get(task_id)
+                    session_task = self._session_tasks.get(session_key) if session_key else None
+                    stopped = (
+                        (dispatch is None or dispatch.done())
+                        and (session_task is None or session_task.done())
+                    )
+                    if stopped:
+                        self._pending_replies.pop(context_id, None)
+                        self._pending_tasks.pop(context_id, None)
+                        self._active_tasks.pop(task_id, None)
+                        self._active_session_keys.pop(task_id, None)
+                        self._dispatch_futures.pop(task_id, None)
+                        self._lease_heartbeats.pop(task_id, None)
+                        self._stream_buffers.pop(context_id, None)
+                if stopped:
+                    deactivate(context_id)
+                    return
+                time.sleep(0.05)
+
+        threading.Thread(
+            target=watch,
+            name=f"a2a-authority-{task_id[-8:]}",
+            daemon=True,
+        ).start()
 
     def _apply_cancellation(self, task: dict) -> dict:
         """Apply or retry durable cancellation without overstating success."""
@@ -1195,12 +1529,28 @@ class A2AAdapter(BasePlatformAdapter):
         with self._pending_lock:
             self._active_session_keys[task_id] = session_key
 
-        task, dispatch_allowed = self._tasks.mark_dispatched(
-            task_id,
-            owner=self._instance_id,
-            incarnation=int(task["incarnation"]),
-            lease_seconds=self.lease_seconds,
-        )
+        try:
+            task, dispatch_allowed = self._tasks.mark_dispatched(
+                task_id,
+                owner=self._instance_id,
+                incarnation=int(task["incarnation"]),
+                lease_seconds=self.lease_seconds,
+            )
+        except Exception:
+            # The policy is installed before the durable dispatch fence so no
+            # tool can run without it. If that fence itself fails, roll back
+            # every process-local authority before propagating the unknown
+            # durable outcome to the HTTP recovery contract.
+            with self._pending_lock:
+                self._pending_replies.pop(context_id, None)
+                self._pending_tasks.pop(context_id, None)
+                self._active_tasks.pop(task_id, None)
+                self._active_session_keys.pop(task_id, None)
+                self._dispatch_futures.pop(task_id, None)
+                self._lease_heartbeats.pop(task_id, None)
+                self._stream_buffers.pop(context_id, None)
+            deactivate(context_id)
+            raise
         if not dispatch_allowed:
             with self._pending_lock:
                 self._pending_replies.pop(context_id, None)
@@ -1247,6 +1597,7 @@ class A2AAdapter(BasePlatformAdapter):
                 task, protocol.STATE_FAILED, f"Dispatch failed: {e}"
             ))
 
+        release_authority = True
         try:
             current = self._tasks.get_task(task_id, enforce_capability=False) or task
             if current.get("cancel_requested_at") is not None:
@@ -1293,22 +1644,56 @@ class A2AAdapter(BasePlatformAdapter):
                     with self._pending_lock:
                         self._lease_heartbeats[task_id] = time.monotonic()
         except _AgentShuttingDown:
-            self._tasks.request_stop(
-                task_id,
-                reason="shutdown",
-                backstop="gateway.cancel_session_processing",
-            )
-            self._tasks.mark_execution_uncertain(task_id, reason="shutdown")
+            current = self._tasks.get_task(task_id, enforce_capability=False)
+            if current is not None and current["state"] not in TERMINAL_STATES:
+                self._tasks.request_stop(
+                    task_id,
+                    reason="shutdown",
+                    backstop="gateway.cancel_session_processing",
+                )
+                stopped = self._interrupt_task(task_id)
+                if stopped:
+                    try:
+                        self._tasks.confirm_execution_stopped(
+                            task_id,
+                            terminal_state=protocol.STATE_FAILED,
+                            result_text="[task stopped because the A2A worker disconnected]",
+                            lease_owner=self._instance_id,
+                            incarnation=int(current["incarnation"]),
+                        )
+                    except InvalidTaskState:
+                        pass
+                else:
+                    self._tasks.mark_execution_uncertain(task_id, reason="shutdown-unconfirmed")
+                    release_authority = False
         except _TaskInterrupted:
-            pass
+            try:
+                current = self._tasks.get_task(task_id, enforce_capability=False)
+            except Exception:
+                current = None
+            with self._pending_lock:
+                dispatch = self._dispatch_futures.get(task_id)
+                session_key = self._active_session_keys.get(task_id)
+                session_task = self._session_tasks.get(session_key) if session_key else None
+            if (
+                current is not None
+                and current.get("execution_uncertain_at") is not None
+                and not (
+                    (dispatch is None or dispatch.done())
+                    and (session_task is None or session_task.done())
+                )
+            ):
+                release_authority = False
         except _LeaseLost:
             self._tasks.request_stop(
                 task_id,
                 reason="lease-lost",
                 backstop="gateway.cancel_session_processing",
             )
-            self._interrupt_task(task_id)
+            stopped = self._interrupt_task(task_id)
             self._tasks.mark_execution_uncertain(task_id, reason="lease-lost")
+            if not stopped:
+                release_authority = False
         except TimeoutError:
             is_deadline = deadline_at is not None and deadline_at <= time.time()
             reason = "deadline" if is_deadline else "timeout"
@@ -1337,17 +1722,58 @@ class A2AAdapter(BasePlatformAdapter):
                 self._tasks.mark_execution_uncertain(
                     task_id, reason=f"{reason}-stop-unconfirmed"
                 )
+                release_authority = False
+        except Exception:
+            # A storage/lease fault after dispatch creates an unknown network
+            # outcome, never permission to abandon a running execution. Stop
+            # it through the process-local gateway handle even if the durable
+            # ledger itself is temporarily unavailable.
+            try:
+                self._tasks.request_stop(
+                    task_id,
+                    reason="internal-error",
+                    backstop="gateway.cancel_session_processing",
+                )
+            except Exception:
+                pass
+            stopped = self._interrupt_task(task_id)
+            if stopped:
+                try:
+                    current = self._tasks.get_task(
+                        task_id, enforce_capability=False,
+                    ) or task
+                    if current["state"] not in TERMINAL_STATES:
+                        self._finish_task(
+                            current,
+                            protocol.STATE_FAILED,
+                            "[task stopped after an internal control-plane failure]",
+                            allow_uncertain=True,
+                        )
+                except Exception:
+                    pass
+            else:
+                release_authority = False
+                try:
+                    self._tasks.mark_execution_uncertain(
+                        task_id, reason="internal-error-stop-unconfirmed"
+                    )
+                except Exception:
+                    pass
+            raise
         finally:
-            with self._pending_lock:
-                if self._pending_replies.get(context_id) is fut:
-                    self._pending_replies.pop(context_id, None)
-                    self._pending_tasks.pop(context_id, None)
-                self._active_tasks.pop(task_id, None)
-                self._active_session_keys.pop(task_id, None)
-                self._dispatch_futures.pop(task_id, None)
-                self._lease_heartbeats.pop(task_id, None)
-                self._stream_buffers.pop(context_id, None)
-            deactivate(context_id)
+            if release_authority:
+                with self._pending_lock:
+                    if self._pending_replies.get(context_id) is fut:
+                        self._pending_replies.pop(context_id, None)
+                        self._pending_tasks.pop(context_id, None)
+                    self._active_tasks.pop(task_id, None)
+                    self._active_session_keys.pop(task_id, None)
+                    self._dispatch_futures.pop(task_id, None)
+                    self._lease_heartbeats.pop(task_id, None)
+                    self._stream_buffers.pop(context_id, None)
+                deactivate(context_id)
+            else:
+                self._release_authority_when_execution_stops(task_id, context_id)
 
         final_task = self._tasks.get_task(task_id, enforce_capability=False)
         if final_task is None:
@@ -1372,9 +1798,9 @@ class A2AAdapter(BasePlatformAdapter):
         keys straight back to the blocked HTTP request.
 
         The gateway marks final user-visible replies with ``metadata['notify']``.
-        Progress, status, and editable preview sends intentionally lack that
-        marker; those must not satisfy the JSON-RPC caller, or the caller sees
-        a banner/status update instead of the agent's actual answer.
+        Every other send is progress/status transport and is ignored. It must
+        never be concatenated into the final answer: gateway progress is not a
+        streaming-delta protocol and may contain tool names or heartbeats.
         """
         is_final_reply = bool((metadata or {}).get("notify"))
         with self._pending_lock:
@@ -1382,19 +1808,14 @@ class A2AAdapter(BasePlatformAdapter):
             task_id = self._pending_tasks.get(chat_id)
             if fut is not None and not fut.done():
                 if not is_final_reply:
-                    if (content or "").startswith("⏩"):
-                        return SendResult(success=True, message_id=None)
-                    previous = self._stream_buffers.get(chat_id, "")
-                    incoming = security.redact_outbound(content or "")
-                    self._stream_buffers[chat_id] = (
-                        incoming if incoming.startswith(previous) else previous + incoming
-                    )
                     return SendResult(success=True, message_id=None)
-                previous = self._stream_buffers.pop(chat_id, "")
-                previous = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", previous)
-                previous = re.sub(r"[▉█▌▋▍▎▏▐]+\s*$", "", previous)
                 incoming = security.redact_outbound(content or "")
-                content = incoming if incoming.startswith(previous) else previous + incoming
+                if len(incoming.encode("utf-8")) > _MAX_RESULT_TEXT_BYTES:
+                    incoming = "[agent result exceeds the supported A2A response size limit]"
+                    terminal_state = protocol.STATE_FAILED
+                else:
+                    terminal_state = protocol.STATE_COMPLETED
+                content = incoming
                 if task_id:
                     try:
                         current = self._tasks.get_task(
@@ -1404,7 +1825,7 @@ class A2AAdapter(BasePlatformAdapter):
                             raise InvalidTaskState("durable task state disappeared")
                         task, emitted = self._tasks.terminalize(
                             task_id,
-                            protocol.STATE_COMPLETED,
+                            terminal_state,
                             security.redact_outbound(content or ""),
                             lease_owner=self._instance_id,
                             incarnation=int(current["incarnation"]),

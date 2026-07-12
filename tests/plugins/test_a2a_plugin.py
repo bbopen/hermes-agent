@@ -107,6 +107,28 @@ class TestBindSafety:
         assert security.localhost_only(extra) is False
         assert security.resolve_bind_host(extra) == "100.89.114.61"
 
+    def test_fullwidth_percent_cannot_hide_unspecified_advertised_host(self):
+        with pytest.raises(ValueError, match="public DNS requires https"):
+            security.validate_advertised_url(
+                "http://％30％2e％30％2e％30％2e％30/"
+            )
+
+    def test_public_listener_cannot_implicitly_advertise_cleartext_http(self, monkeypatch):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        monkeypatch.setenv("SPARK_A2A_TOKEN", "peer-secret")
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "host": "93.184.216.34",
+            "trusted_peers": {"spark-primary": {
+                "credentials": [{
+                    "key_id": "spark-current", "token_env": "SPARK_A2A_TOKEN",
+                }],
+                "on_behalf_of": ["brett"], "capabilities": ["system.proof"],
+            }},
+        }))
+        assert "public A2A listeners require" in adapter._config_error
+
 
 class TestBearerAuth:
     def test_credential_schema_rejects_coercions_and_unknown_fields(self):
@@ -331,6 +353,12 @@ class TestAudit:
         assert rec["direction"] == "inbound"
         assert rec["peer"] == "peer-y"
         assert rec["task_id"] == "task-1"
+
+    def test_audit_never_changes_global_profile_directory_mode(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        tmp_path.chmod(0o701)
+        assert security.audit("inbound", "peer", "task-1", "hello")
+        assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o701
 
     def test_audit_is_owner_only_and_contains_no_prompt_body(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -1073,6 +1101,18 @@ class TestClientTools:
         ])
         with pytest.raises(ValueError, match="address class"):
             tools._pinned_addresses("http://hms-m1:9900/")
+
+    def test_credentialed_private_name_cannot_resolve_to_public_cleartext(self, monkeypatch):
+        monkeypatch.setattr(tools, "_load_config", lambda: {
+            "a2a_agents": {"worker": {"url": "http://hms-m1:9900"}},
+        })
+        monkeypatch.setattr(tools, "_resolve_addresses", lambda *args: [
+            (2, 1, 6, "", ("93.184.216.34", 9900)),
+        ])
+        with pytest.raises(ValueError, match="bearer credentials require HTTPS"):
+            tools._pinned_addresses(
+                "http://hms-m1:9900/", credentialed=True,
+            )
     @pytest.mark.parametrize("peers", [["peer"], {"peer": "bad"}, {"peer": {"url": "http://x", "auth": []}}])
     def test_malformed_outbound_peer_config_is_controlled(self, monkeypatch, peers):
         monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": peers})
@@ -1105,6 +1145,27 @@ class TestClientTools:
         out = tools.a2a_discover({"url": "http://localhost:9999"})
         assert "researcher" in out
         assert "search" in out
+
+    def test_discovery_rejects_path_query_fragment_without_reflection(self, monkeypatch):
+        secret = "github_pat_11AA22bb33CC44dd55EE66ff77GG88hh"
+        monkeypatch.setattr(tools, "_http_get_json", lambda *args: pytest.fail(
+            "credential-bearing discovery URL reached transport"
+        ))
+        for suffix in (f"/card?token={secret}", f"/?next={secret}", f"/#{secret}"):
+            out = tools.a2a_discover({"url": "https://example.com" + suffix})
+            assert "unsafe peer URL" in out
+            assert secret not in out
+
+    def test_direct_call_rejects_non_origin_url_without_reflection(self, monkeypatch):
+        secret = "opaque-random-credential-value-48291"
+        monkeypatch.setattr(tools, "_http_post_json", lambda *args: pytest.fail(
+            "credential-bearing direct call URL reached transport"
+        ))
+        out = tools.a2a_call({
+            "agent": f"https://example.com/rpc?token={secret}", "message": "hello",
+        })
+        assert "invalid A2A peer configuration" in out
+        assert secret not in out
 
     @pytest.mark.parametrize("url", [
         "http://127.0.0.1:9900",
@@ -1223,6 +1284,144 @@ class TestClientTools:
         assert captured["headers"]["X-A2A-Key-Id"] == "worker-current"
         metadata = captured["body"]["params"]["message"]["metadata"]
         assert metadata == {"on_behalf_of": "brett", "capability": "system.proof"}
+
+    def test_public_cleartext_peer_never_receives_bearer(self, monkeypatch):
+        monkeypatch.setenv("WORKER_A2A_TOKEN", "dedicated-secret")
+        monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {
+            "public-worker": {
+                "url": "http://worker.example.com",
+                "auth": {"type": "bearer", "key_env": "WORKER_A2A_TOKEN"},
+            }
+        }})
+        monkeypatch.setattr(tools, "_http_get_json", lambda *args: pytest.fail(
+            "public cleartext credential reached transport"
+        ))
+        out = tools.a2a_call({"agent": "public-worker", "message": "prove it"})
+        assert "bearer credentials require HTTPS" in out
+        assert "dedicated-secret" not in out
+
+    def test_peer_cannot_reflect_exact_bearer_into_output_or_persistence(self, monkeypatch):
+        token = "dedicated-secret-without-vendor-shape"
+        monkeypatch.setenv("WORKER_A2A_TOKEN", token)
+        monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {
+            "worker": {
+                "url": "http://hms-m1:9900",
+                "auth": {"type": "bearer", "key_env": "WORKER_A2A_TOKEN"},
+            }
+        }})
+        monkeypatch.setattr(tools, "_http_get_json", lambda *args: None)
+        persisted = []
+        monkeypatch.setattr(protocol, "persist_message", lambda *args: persisted.append(args))
+
+        def fake_post(_url, body, _headers, _timeout):
+            return protocol.jsonrpc_result(
+                body["id"],
+                protocol.build_task(
+                    "task-safe", "ctx-safe", protocol.STATE_COMPLETED,
+                    f"peer echoed Authorization: Bearer {token}",
+                ),
+            )
+
+        monkeypatch.setattr(tools, "_http_post_json", fake_post)
+        out = tools.a2a_call({"agent": "worker", "message": "prove it"})
+        assert token not in out
+        assert all(token not in str(args) for args in persisted)
+
+    def test_peer_error_cannot_reflect_exact_bearer(self, monkeypatch):
+        token = "dedicated-secret-without-vendor-shape"
+        monkeypatch.setenv("WORKER_A2A_TOKEN", token)
+        monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {
+            "worker": {
+                "url": "http://hms-m1:9900",
+                "auth": {"type": "bearer", "key_env": "WORKER_A2A_TOKEN"},
+            }
+        }})
+        monkeypatch.setattr(tools, "_http_get_json", lambda *args: None)
+        monkeypatch.setattr(tools, "_http_post_json", lambda _u, body, _h, _t: {
+            "jsonrpc": "2.0", "id": body["id"],
+            "error": {"code": -32000, "message": f"Bearer {token}"},
+        })
+        out = tools.a2a_call({"agent": "worker", "message": "prove it"})
+        assert token not in out
+
+    def test_server_control_extension_is_producer_consumer_compatible(self):
+        task = protocol.build_task("task-safe", "ctx-safe", protocol.STATE_WORKING)
+        task["x-hermes-control"] = {"execution": "uncertain", "cancellation": "requested"}
+        assert tools._jsonrpc_response_error(protocol.jsonrpc_result("rpc", task)) == ""
+        task["x-hermes-control"]["execution"] = "maybe"
+        assert tools._jsonrpc_response_error(protocol.jsonrpc_result("rpc", task))
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            lambda card: card.update(version={}),
+            lambda card: card.update(defaultInputModes="text/plain"),
+            lambda card: card.update(defaultOutputModes=[7]),
+            lambda card: card.update(securitySchemes="bearer", security=[]),
+            lambda card: card["skills"][0].update(unknown=True),
+        ],
+    )
+    def test_agent_card_nested_schema_is_strict(self, mutate):
+        card = protocol.build_agent_card(
+            name="worker", url="https://worker.example/", description="worker",
+            skills=[{"id": "proof", "name": "proof", "description": "proof", "tags": ["proof"]}],
+        )
+        mutate(card)
+        assert tools._agent_card_error(card)
+
+    def test_http_500_recovers_by_request_identity_without_duplicate_send(self, monkeypatch):
+        monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {
+            "worker": {"url": "http://hms-m1:9900", "timeout": 2},
+        }})
+        monkeypatch.setattr(tools, "_http_get_json", lambda *args: None)
+        calls = []
+
+        def fake_post(_url, body, _headers, _timeout):
+            calls.append(body["method"])
+            if body["method"] == "message/send":
+                raise urllib.error.HTTPError("safe", 500, "unknown", {}, None)
+            assert body["method"] == "tasks/getByRequest"
+            return protocol.jsonrpc_result(
+                body["id"],
+                protocol.build_task(
+                    "task-safe", "ctx-safe", protocol.STATE_COMPLETED, "executed once",
+                ),
+            )
+
+        monkeypatch.setattr(tools, "_http_post_json", fake_post)
+        out = tools.a2a_call({
+            "agent": "worker", "message": "prove it", "request_id": "stable-request",
+        })
+        assert "executed once" in out
+        assert calls == ["message/send", "tasks/getByRequest"]
+
+    def test_poll_404_at_deadline_returns_controlled_unknown_outcome(self, monkeypatch):
+        monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {
+            "worker": {"url": "http://hms-m1:9900", "timeout": 0.01},
+        }})
+        monkeypatch.setattr(tools, "_http_get_json", lambda *args: None)
+
+        def fake_post(_url, body, _headers, _timeout):
+            if body["method"] == "message/send":
+                raise OSError("connection reset")
+            time.sleep(0.02)
+            raise urllib.error.HTTPError("safe", 404, "missing", {}, None)
+
+        monkeypatch.setattr(tools, "_http_post_json", fake_post)
+        out = tools.a2a_call({
+            "agent": "worker", "message": "prove it", "request_id": "stable-request",
+        })
+        assert "outcome of request stable-request" in out
+        assert "lookup deadline expired" in out
+
+    def test_task_result_is_not_duplicated_across_status_and_artifact(self):
+        text = "x" * 300_000
+        task = protocol.build_task(
+            "task-safe", "ctx-safe", protocol.STATE_COMPLETED, text,
+        )
+        encoded = json.dumps(protocol.jsonrpc_result("rpc", task)).encode()
+        assert encoded.count(text.encode()) == 1
+        assert len(encoded) < tools._MAX_OUTBOUND_RESPONSE_BYTES
 
     def test_outbound_audit_failure_prevents_network_dispatch(self, monkeypatch):
         monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {
@@ -1370,7 +1569,7 @@ class TestReplyCapture:
         ))
         assert result.success is False
         assert future.done() and future.exception() is not None
-    def test_stream_cursor_preview_plus_final_delta_is_exact(self):
+    def test_progress_preview_never_contaminates_final_reply(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.a2a.adapter import A2AAdapter
 
@@ -1383,7 +1582,7 @@ class TestReplyCapture:
             await adapter.send("ctx-cursor", "world", metadata={"notify": True})
 
         asyncio.run(run())
-        assert future.result(timeout=0) == "Hello world"
+        assert future.result(timeout=0) == "world"
     def test_stream_preview_accumulates_and_commits_exact_final_once(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.a2a.adapter import A2AAdapter
@@ -1535,6 +1734,119 @@ class TestReplyCapture:
         assert fut.done() is True
         assert isinstance(fut.exception(), RuntimeError)
 
+    def test_disconnect_cancels_live_execution_before_releasing_policy(
+        self, monkeypatch, tmp_path,
+    ):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = A2AAdapter(PlatformConfig(enabled=True))
+        task, _ = adapter._tasks.claim_request(
+            principal="localhost", on_behalf_of="", capability="",
+            request_key="disconnect-running",
+            payload_sha256=canonical_payload_sha256({"message": "running"}),
+            requested_context_id="ctx-disconnect", task_id=protocol.new_task_id(),
+            deadline_at=None, lease_owner=adapter._instance_id, lease_seconds=60,
+        )
+        task, dispatched = adapter._tasks.mark_dispatched(
+            task["task_id"], owner=adapter._instance_id,
+            incarnation=task["incarnation"], lease_seconds=60,
+        )
+        assert dispatched
+        policy = runtime_policy.ActivePolicy(
+            principal="localhost", on_behalf_of="", capability="",
+            allowed_tools=frozenset({"*"}),
+        )
+        assert runtime_policy.activate("ctx-disconnect", policy)
+        waiter = Future()
+
+        async def run():
+            session_task = asyncio.create_task(asyncio.Event().wait())
+            dispatch = Future()
+            with adapter._pending_lock:
+                adapter._pending_replies["ctx-disconnect"] = waiter
+                adapter._pending_tasks["ctx-disconnect"] = task["task_id"]
+                adapter._active_tasks[task["task_id"]] = "ctx-disconnect"
+                adapter._active_session_keys[task["task_id"]] = "a2a:ctx-disconnect"
+                adapter._dispatch_futures[task["task_id"]] = dispatch
+            adapter._session_tasks["a2a:ctx-disconnect"] = session_task
+
+            async def cancel_session(session_key):
+                assert runtime_policy.get("ctx-disconnect") == policy
+                target = adapter._session_tasks[session_key]
+                target.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await target
+
+            monkeypatch.setattr(adapter, "cancel_session_processing", cancel_session)
+            await adapter.disconnect()
+            assert session_task.done()
+
+        asyncio.run(run())
+        stored = adapter._tasks.get_task(task["task_id"], enforce_capability=False)
+        assert stored["state"] == protocol.STATE_FAILED
+        assert stored["execution_uncertain_at"] is None
+        assert runtime_policy.get("ctx-disconnect") is None
+        assert waiter.done() and isinstance(waiter.exception(), RuntimeError)
+        assert adapter._active_tasks == {}
+
+    def test_unconfirmed_disconnect_retains_policy_until_execution_really_exits(
+        self, monkeypatch, tmp_path,
+    ):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = A2AAdapter(PlatformConfig(enabled=True))
+        task, _ = adapter._tasks.claim_request(
+            principal="localhost", on_behalf_of="", capability="",
+            request_key="disconnect-unconfirmed",
+            payload_sha256=canonical_payload_sha256({"message": "running"}),
+            requested_context_id="ctx-unconfirmed", task_id=protocol.new_task_id(),
+            deadline_at=None, lease_owner=adapter._instance_id, lease_seconds=60,
+        )
+        task, dispatched = adapter._tasks.mark_dispatched(
+            task["task_id"], owner=adapter._instance_id,
+            incarnation=task["incarnation"], lease_seconds=60,
+        )
+        assert dispatched
+        policy = runtime_policy.ActivePolicy(
+            principal="localhost", on_behalf_of="", capability="",
+            allowed_tools=frozenset({"*"}),
+        )
+        assert runtime_policy.activate("ctx-unconfirmed", policy)
+
+        async def run():
+            session_task = asyncio.create_task(asyncio.Event().wait())
+            dispatch = Future()
+            with adapter._pending_lock:
+                adapter._pending_replies["ctx-unconfirmed"] = Future()
+                adapter._pending_tasks["ctx-unconfirmed"] = task["task_id"]
+                adapter._active_tasks[task["task_id"]] = "ctx-unconfirmed"
+                adapter._active_session_keys[task["task_id"]] = "a2a:ctx-unconfirmed"
+                adapter._dispatch_futures[task["task_id"]] = dispatch
+            adapter._session_tasks["a2a:ctx-unconfirmed"] = session_task
+
+            async def cannot_stop(_session_key):
+                return None
+
+            monkeypatch.setattr(adapter, "cancel_session_processing", cannot_stop)
+            await adapter.disconnect()
+            assert runtime_policy.get("ctx-unconfirmed") == policy
+            assert task["task_id"] in adapter._active_tasks
+            stored = adapter._tasks.get_task(task["task_id"], enforce_capability=False)
+            assert stored["execution_uncertain_at"] is not None
+
+            session_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await session_task
+            await asyncio.sleep(0.15)
+            assert runtime_policy.get("ctx-unconfirmed") is None
+            assert task["task_id"] not in adapter._active_tasks
+
+        asyncio.run(run())
+
 
 class TestCapabilityEnforcement:
     def test_rule_matching_distinguishes_bool_from_int(self, monkeypatch):
@@ -1626,6 +1938,28 @@ class TestCapabilityEnforcement:
 
 
 class TestRequestPolicy:
+    def test_inbound_jsonrpc_message_part_and_params_schema_is_strict(self):
+        from plugins.platforms.a2a import adapter as adapter_module
+
+        valid = {"message": protocol.text_message("user", "hello", message_id="request-1")}
+        assert adapter_module._params_schema_error("message/send", valid) == ""
+        malformed = json.loads(json.dumps(valid))
+        malformed["message"]["role"] = "agent"
+        assert adapter_module._params_schema_error("message/send", malformed)
+        malformed = json.loads(json.dumps(valid))
+        malformed["message"]["parts"][0].update(type="text")
+        assert adapter_module._params_schema_error("message/send", malformed)
+        malformed = json.loads(json.dumps(valid))
+        malformed["message"]["junk"] = 1
+        assert adapter_module._params_schema_error("message/send", malformed)
+        malformed = json.loads(json.dumps(valid))
+        malformed["junk"] = 1
+        assert adapter_module._params_schema_error("message/send", malformed)
+        with pytest.raises(ValueError):
+            adapter_module._parse_json_int("9" * 4000)
+        with pytest.raises(ValueError):
+            adapter_module._parse_json_float("1e400")
+
     def test_authenticated_identity_replaces_caller_peer(self, monkeypatch):
         monkeypatch.setenv("SPARK_A2A_TOKEN", "secret")
         from gateway.config import PlatformConfig
@@ -1724,6 +2058,30 @@ class TestTaskTerminalControls:
         result = adapter._handle_inbound_task(params, self._policy(), "rpc-deadline")
         assert result["status"]["state"] == protocol.STATE_FAILED
         assert "deadline elapsed" in protocol.extract_text(result["artifacts"][0])
+
+    def test_dispatch_fence_failure_releases_policy_and_all_local_state(
+        self, monkeypatch, tmp_path,
+    ):
+        adapter = self._adapter(monkeypatch, tmp_path)
+        adapter._loop = object()
+        adapter._message_handler = object()
+        monkeypatch.setattr(adapter, "_flush_audit_outbox", lambda *args: True)
+        monkeypatch.setattr(
+            adapter._tasks, "mark_dispatched",
+            lambda *args, **kwargs: (_ for _ in ()).throw(sqlite3.OperationalError("disk fault")),
+        )
+        params = {"message": {
+            **protocol.text_message("user", "do not dispatch", message_id="fence-request"),
+            "contextId": "ctx-fence",
+        }}
+        with pytest.raises(sqlite3.OperationalError, match="disk fault"):
+            adapter._handle_inbound_task(params, self._policy(), "rpc-fence")
+        assert runtime_policy.get("ctx-fence") is None
+        assert adapter._pending_replies == {}
+        assert adapter._pending_tasks == {}
+        assert adapter._active_tasks == {}
+        assert adapter._active_session_keys == {}
+        assert adapter._dispatch_futures == {}
 
     def test_self_owned_expired_lease_requires_live_handler_heartbeat(
         self, monkeypatch, tmp_path,
@@ -2407,6 +2765,171 @@ class TestPrincipalBoundTaskHTTP:
 
 @pytest.mark.integration
 class TestInboundRoundTrip:
+    def test_real_http_unknown_outcome_recovers_without_duplicate_execution(
+        self, monkeypatch, tmp_path,
+    ):
+        from gateway.config import PlatformConfig
+        from gateway.session import build_session_key
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("WORKER_A2A_TOKEN", "dedicated-a2a-secret")
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "host": "127.0.0.1", "port": 0, "reply_timeout": 3,
+            "trusted_peers": {"spark-primary": {
+                "credentials": [{
+                    "key_id": "spark-current", "token_env": "WORKER_A2A_TOKEN",
+                }],
+                "on_behalf_of": ["brett"], "capabilities": ["system.proof"],
+            }},
+            "capability_tools": {"system.proof": []},
+        }))
+        adapter.lease_seconds = 0.3
+        adapter._message_handler = object()
+        executions = []
+
+        async def fake_handle_message(event):
+            executions.append(event.message_id)
+            session_key = build_session_key(
+                event.source,
+                group_sessions_per_user=adapter.config.extra.get(
+                    "group_sessions_per_user", True,
+                ),
+                thread_sessions_per_user=adapter.config.extra.get(
+                    "thread_sessions_per_user", False,
+                ),
+            )
+            adapter._session_tasks[session_key] = asyncio.current_task()
+            try:
+                await asyncio.sleep(2)
+                await adapter.send(
+                    event.source.chat_id, "must be canceled", metadata={"notify": True},
+                )
+            finally:
+                adapter._session_tasks.pop(session_key, None)
+
+        adapter.handle_message = fake_handle_message  # type: ignore
+        original_renew = adapter._tasks.renew_lease
+        renew_calls = 0
+
+        def fail_first_renew(*args, **kwargs):
+            nonlocal renew_calls
+            renew_calls += 1
+            if renew_calls == 1:
+                raise sqlite3.OperationalError("injected lease fault")
+            return original_renew(*args, **kwargs)
+
+        monkeypatch.setattr(adapter._tasks, "renew_lease", fail_first_renew)
+
+        async def run():
+            assert await adapter.connect()
+            monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {
+                "worker": {
+                    "url": f"http://127.0.0.1:{adapter.port}",
+                    "auth": {
+                        "type": "bearer", "key_env": "WORKER_A2A_TOKEN",
+                        "key_id": "spark-current",
+                    },
+                    "on_behalf_of": "brett", "capability": "system.proof",
+                    "timeout": 3,
+                },
+            }})
+            try:
+                result = await asyncio.to_thread(tools.a2a_call, {
+                    "agent": "worker", "message": "execute once",
+                    "request_id": "stable-unknown-outcome",
+                })
+                assert "internal control-plane failure" in result
+                assert "failed" in result
+                assert executions and len(executions) == 1
+                assert renew_calls == 1
+            finally:
+                await adapter.disconnect()
+
+        asyncio.run(run())
+
+    def test_http_edge_rejects_wrong_path_malformed_schema_and_duplicate_auth_headers(
+        self, monkeypatch, tmp_path,
+    ):
+        import socket
+        from gateway.config import PlatformConfig
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("RAW_A2A_TOKEN", "valid-raw-token")
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "host": "127.0.0.1", "port": 0,
+            "trusted_peers": {"spark-primary": {
+                "credentials": [{
+                    "key_id": "raw-current", "token_env": "RAW_A2A_TOKEN",
+                }],
+                "on_behalf_of": ["brett"], "capabilities": ["system.proof"],
+            }},
+            "capability_tools": {"system.proof": []},
+        }))
+
+        def raw_post(path, body, extra_headers=()):
+            encoded = json.dumps(body).encode()
+            headers = [
+                f"POST {path} HTTP/1.1",
+                f"Host: 127.0.0.1:{adapter.port}",
+                "Content-Type: application/json",
+                f"Content-Length: {len(encoded)}",
+                f"A2A-Version: {protocol.PROTOCOL_VERSION}",
+                *extra_headers,
+                "Connection: close", "", "",
+            ]
+            client = socket.create_connection(("127.0.0.1", adapter.port), timeout=5)
+            try:
+                client.sendall("\r\n".join(headers).encode() + encoded)
+                response = b""
+                while True:
+                    chunk = client.recv(65536)
+                    if not chunk:
+                        break
+                    response += chunk
+            finally:
+                client.close()
+            return int(response.split(b"\r\n", 1)[0].split()[1])
+
+        valid = {
+            "jsonrpc": "2.0", "id": "rpc-1", "method": "message/send",
+            "params": {"message": {
+                **protocol.text_message("user", "hello", message_id="request-1"),
+                "metadata": {"on_behalf_of": "brett", "capability": "system.proof"},
+            }},
+        }
+        valid_auth = ("Authorization: Bearer valid-raw-token", "X-A2A-Key-Id: raw-current")
+
+        async def run():
+            assert await adapter.connect()
+            try:
+                assert await asyncio.to_thread(raw_post, "/evil", valid) == 404
+                malformed = json.loads(json.dumps(valid))
+                malformed["params"]["message"]["role"] = "agent"
+                malformed["params"]["message"]["parts"][0]["type"] = "text"
+                malformed["junk"] = 1e300
+                assert await asyncio.to_thread(raw_post, "/", malformed, valid_auth) == 400
+                assert await asyncio.to_thread(
+                    raw_post, "/", valid,
+                    (
+                        "Authorization: Bearer valid-raw-token",
+                        "Authorization: Bearer invalid-second",
+                        "X-A2A-Key-Id: raw-current",
+                    ),
+                ) == 400
+                assert await asyncio.to_thread(
+                    raw_post, "/", valid,
+                    (
+                        "Authorization: Bearer valid-raw-token",
+                        "X-A2A-Key-Id: raw-current", "X-A2A-Key-Id: invalid-second",
+                    ),
+                ) == 400
+            finally:
+                await adapter.disconnect()
+
+        asyncio.run(run())
+
     def test_live_server_card_and_message_send(self, monkeypatch):
         """Start the real adapter server, hit the Agent Card, then send a task
         and verify the mocked agent's reply comes back as an A2A Task."""

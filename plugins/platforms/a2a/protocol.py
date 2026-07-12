@@ -162,9 +162,9 @@ def build_task(
         "kind": "task",
     }
     if agent_text:
-        task["status"]["message"] = text_message(
-            "agent", agent_text, message_id=f"{task_id}-status"
-        )
+        # The durable result is represented exactly once. Duplicating the same
+        # bytes in status.message and an artifact made an otherwise valid
+        # producer response exceed the consumer's 512 KiB contract.
         task["artifacts"] = [{
             "artifactId": f"{task_id}-artifact",
             "parts": [{"kind": "text", "text": agent_text}],
