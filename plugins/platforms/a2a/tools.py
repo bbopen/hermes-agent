@@ -527,16 +527,20 @@ def _json_value_error(value: Any) -> bool:
             continue
         return True
     try:
-        encoded = json.dumps(
-            value,
+        encoder = json.JSONEncoder(
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=True,
             allow_nan=False,
-        ).encode("utf-8")
+        )
+        encoded_size = 0
+        for chunk in encoder.iterencode(value):
+            encoded_size += len(chunk.encode("utf-8"))
+            if encoded_size > max_bytes:
+                return True
     except (TypeError, ValueError, UnicodeError, RecursionError):
         return True
-    return len(encoded) > max_bytes
+    return False
 
 
 def _valid_json_metadata(value: Any) -> bool:

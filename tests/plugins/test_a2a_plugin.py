@@ -1008,6 +1008,23 @@ class TestClientTools:
         assert A2AAdapter._request_key({
             "message": {"messageId": "one", "metadata": {"idempotencyKey": "two"}},
         }, "rpc") == ""
+        assert A2AAdapter._request_key({
+            "message": {"parts": []}, "idempotencyKey": "top-only",
+        }, "rpc") == "top-only"
+        assert A2AAdapter._request_key({
+            "message": {
+                "messageId": "same",
+                "metadata": {"idempotencyKey": "same"},
+            },
+            "idempotencyKey": "same",
+            "metadata": {"idempotencyKey": "same"},
+        }, "rpc") == "same"
+        assert A2AAdapter._request_key({
+            "message": {"messageId": "one"}, "idempotencyKey": "two",
+        }, "rpc") == ""
+        assert A2AAdapter._request_key({
+            "message": {"messageId": "one", "metadata": None},
+        }, "rpc") == ""
         assert A2AAdapter._task_id_param({"taskId": []}) == ""
         assert A2AAdapter._task_id_param({"taskId": "one", "id": "two"}) == ""
 
@@ -1019,6 +1036,10 @@ class TestClientTools:
         assert tools._json_value_error(cyclic)
         assert tools._json_value_error([None] * 500_000)
         assert tools._json_value_error({"escaped": "\x00" * 200_000})
+        byte_limit = 1024 * 1024
+        assert not tools._json_value_error("a" * (byte_limit - 2))
+        assert tools._json_value_error("a" * (byte_limit - 1))
+        assert tools._json_value_error([10 ** 5000] * 9_998)
 
     def test_agent_card_uses_bounded_json_validation(self):
         card = protocol.build_agent_card(
@@ -2064,6 +2085,18 @@ class TestPrincipalBoundTaskHTTP:
                         post, invalid_identifier, "token-a", "a-current",
                     )
                 assert rejected.value.code == 400
+            mismatched_aliases = {
+                "jsonrpc": "2.0", "id": "mismatched-aliases",
+                "method": "message/send",
+                "params": json.loads(json.dumps(valid_params)),
+            }
+            mismatched_aliases["params"]["idempotencyKey"] = "different-request"
+            with pytest.raises(urllib.error.HTTPError) as rejected:
+                await asyncio.to_thread(
+                    post, mismatched_aliases, "token-a", "a-current",
+                )
+            assert rejected.value.code == 400
+            assert calls == []
             unsupported = {
                 "jsonrpc": "2.0", "id": "unsupported-method",
                 "method": "tasks/resubscribe", "params": valid_params,
@@ -2075,10 +2108,15 @@ class TestPrincipalBoundTaskHTTP:
             assert calls == []
 
             message = protocol.text_message("user", "do it once")
+            message.pop("messageId")
             message["contextId"] = "ctx-http-owned"
             message["metadata"] = metadata
+            request_identity = "top-level-request"
             body = {"jsonrpc": "2.0", "id": "rpc-1", "method": "message/send",
-                    "params": {"message": message}}
+                    "params": {
+                        "message": message,
+                        "idempotencyKey": request_identity,
+                    }}
             first = await asyncio.to_thread(post, body, "token-a", "a-current")
             task = first["result"]
             task_id = task["id"]
@@ -2104,7 +2142,7 @@ class TestPrincipalBoundTaskHTTP:
                 "jsonrpc": "2.0", "id": "rpc-lookup",
                 "method": "tasks/getByRequest",
                 "params": {
-                    "requestId": message["messageId"], "metadata": metadata,
+                    "requestId": request_identity, "metadata": metadata,
                     "payloadSha256": adapter._tasks.get_task(
                         task_id, enforce_capability=False,
                     )["payload_sha256"],
@@ -2125,7 +2163,7 @@ class TestPrincipalBoundTaskHTTP:
                 await asyncio.to_thread(post, missing_hash_lookup, "token-a", "a-current")
             assert missing_hash.value.code == 400
             assert TaskStore(adapter._tasks.path).get_task_by_request(
-                message["messageId"], principal="peer-a", on_behalf_of="brett",
+                request_identity, principal="peer-a", on_behalf_of="brett",
                 capability="system.proof",
                 expected_payload_sha256=lookup_body["params"]["payloadSha256"],
             )["task_id"] == task_id

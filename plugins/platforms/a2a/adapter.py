@@ -845,15 +845,21 @@ class A2AAdapter(BasePlatformAdapter):
         message = params.get("message") or {}
         if not isinstance(message, dict):
             return ""
-        metadata = message.get("metadata")
-        if metadata is None:
-            metadata = params.get("metadata")
-        metadata = metadata if isinstance(metadata, dict) else {}
+        message_metadata = message.get("metadata")
+        params_metadata = params.get("metadata")
+        if (
+            ("metadata" in message and not isinstance(message_metadata, dict))
+            or ("metadata" in params and not isinstance(params_metadata, dict))
+        ):
+            return ""
         values = []
         if "messageId" in message:
             values.append(message["messageId"])
-        if "idempotencyKey" in metadata:
-            values.append(metadata["idempotencyKey"])
+        if "idempotencyKey" in params:
+            values.append(params["idempotencyKey"])
+        for candidate in (message_metadata, params_metadata):
+            if isinstance(candidate, dict) and "idempotencyKey" in candidate:
+                values.append(candidate["idempotencyKey"])
         if not values or any(not isinstance(value, str) for value in values):
             return ""
         if any(value != values[0] for value in values[1:]):
