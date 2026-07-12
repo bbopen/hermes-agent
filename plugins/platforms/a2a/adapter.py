@@ -454,6 +454,9 @@ class A2AAdapter(BasePlatformAdapter):
         self._dispatch_stop_requested: set[str] = set()
         self._dispatch_handoff_complete: set[str] = set()
         self._owned_session_tasks: Dict[str, asyncio.Task] = {}
+        self._event_execution_started: set[str] = set()
+        self._event_execution_finished: set[str] = set()
+        self._queued_start_prevented: set[str] = set()
         self._lease_heartbeats: Dict[str, float] = {}
         self._stream_buffers: Dict[str, str] = {}
         self._pending_lock = threading.Lock()
@@ -483,6 +486,34 @@ class A2AAdapter(BasePlatformAdapter):
     @property
     def name(self) -> str:
         return "A2A"
+
+    async def _process_message_background(
+        self, event: MessageEvent, session_key: str,
+    ) -> None:
+        """Bind execution authority to this exact A2A event's owner task.
+
+        ``handle_message`` may queue an event behind an older same-context
+        owner and later transfer ``_session_tasks[session_key]`` to a drain
+        task. Observing that shared map at dispatch handoff therefore captures
+        the wrong owner. This hook runs only when the specific event actually
+        begins, including the drain path, and retains its exact Task through
+        completion.
+        """
+        task_id = str(getattr(event, "message_id", "") or "")
+        current = asyncio.current_task()
+        tracked = False
+        with self._pending_lock:
+            tracked = self._active_tasks.get(task_id) == event.source.chat_id
+            if tracked:
+                self._event_execution_started.add(task_id)
+                if current is not None:
+                    self._owned_session_tasks[task_id] = current
+        try:
+            await super()._process_message_background(event, session_key)
+        finally:
+            if tracked:
+                with self._pending_lock:
+                    self._event_execution_finished.add(task_id)
 
     def _reconcile_durable_tasks(self) -> list[dict[str, Any]]:
         """Reap stale own leases while protecting handlers with a live heartbeat."""
@@ -988,6 +1019,8 @@ class A2AAdapter(BasePlatformAdapter):
                     await self.cancel_session_processing(session_key)
                 await asyncio.sleep(0)
                 with self._pending_lock:
+                    if task_id not in self._event_execution_started:
+                        self._queued_start_prevented.add(task_id)
                     execution_stopped = self._execution_stopped_locked(task_id)
                 current = self._tasks.get_task(task_id, enforce_capability=False) or current
                 if execution_stopped:
@@ -1045,6 +1078,9 @@ class A2AAdapter(BasePlatformAdapter):
                 self._dispatch_stop_requested.discard(task_id)
                 self._dispatch_handoff_complete.discard(task_id)
                 self._owned_session_tasks.pop(task_id, None)
+                self._event_execution_started.discard(task_id)
+                self._event_execution_finished.discard(task_id)
+                self._queued_start_prevented.discard(task_id)
                 self._lease_heartbeats.pop(task_id, None)
                 self._stream_buffers.pop(context_id, None)
         for context_id in stopped_contexts.values():
@@ -1272,8 +1308,28 @@ class A2AAdapter(BasePlatformAdapter):
             return False
         if task_id not in self._dispatch_handoff_complete:
             return False
-        owner = self._owned_session_tasks.get(task_id)
-        return owner is None or owner.done()
+        if task_id in self._event_execution_started:
+            owner = self._owned_session_tasks.get(task_id)
+            return (
+                task_id in self._event_execution_finished
+                and owner is not None
+                and owner.done()
+            )
+        # No execution owner was ever entered. That is proof only after the
+        # event-loop cancellation path explicitly removed any queued event and
+        # prevented the dispatch gate from starting later.
+        return task_id in self._queued_start_prevented
+
+    def _wait_for_execution_stop(self, task_id: str, timeout: float = 1.0) -> bool:
+        """Briefly join post-reply cleanup so immediate next turns can reuse context."""
+        until = time.monotonic() + max(0.0, timeout)
+        while True:
+            with self._pending_lock:
+                if self._execution_stopped_locked(task_id):
+                    return True
+            if time.monotonic() >= until:
+                return False
+            time.sleep(0.005)
 
     def _interrupt_task(self, task_id: str) -> bool:
         """Interrupt and verify the gateway-owned execution task has exited."""
@@ -1293,13 +1349,20 @@ class A2AAdapter(BasePlatformAdapter):
             if dispatch is not None and not dispatch.done():
                 dispatch.cancel()
                 await asyncio.sleep(0)
-            session_task = self._owned_session_tasks.get(task_id)
-            if session_task is None and session_key:
-                session_task = self._session_tasks.get(session_key)
+            session_task = self._session_tasks.get(session_key) if session_key else None
+            exact_owner = self._owned_session_tasks.get(task_id)
             if session_task is not None and not session_task.done() and session_key:
                 await self.cancel_session_processing(session_key)
+            elif exact_owner is not None and not exact_owner.done():
+                exact_owner.cancel()
+                try:
+                    await asyncio.wait_for(asyncio.shield(exact_owner), timeout=5.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
             await asyncio.sleep(0)
             with self._pending_lock:
+                if task_id not in self._event_execution_started:
+                    self._queued_start_prevented.add(task_id)
                 return self._execution_stopped_locked(task_id)
 
         try:
@@ -1342,6 +1405,9 @@ class A2AAdapter(BasePlatformAdapter):
                         self._dispatch_stop_requested.discard(task_id)
                         self._dispatch_handoff_complete.discard(task_id)
                         self._owned_session_tasks.pop(task_id, None)
+                        self._event_execution_started.discard(task_id)
+                        self._event_execution_finished.discard(task_id)
+                        self._queued_start_prevented.discard(task_id)
                         self._lease_heartbeats.pop(task_id, None)
                         self._stream_buffers.pop(context_id, None)
                 if stopped:
@@ -1606,6 +1672,9 @@ class A2AAdapter(BasePlatformAdapter):
                 self._dispatch_stop_requested.discard(task_id)
                 self._dispatch_handoff_complete.discard(task_id)
                 self._owned_session_tasks.pop(task_id, None)
+                self._event_execution_started.discard(task_id)
+                self._event_execution_finished.discard(task_id)
+                self._queued_start_prevented.discard(task_id)
                 self._lease_heartbeats.pop(task_id, None)
                 self._stream_buffers.pop(context_id, None)
             deactivate(context_id)
@@ -1620,6 +1689,9 @@ class A2AAdapter(BasePlatformAdapter):
                 self._dispatch_stop_requested.discard(task_id)
                 self._dispatch_handoff_complete.discard(task_id)
                 self._owned_session_tasks.pop(task_id, None)
+                self._event_execution_started.discard(task_id)
+                self._event_execution_finished.discard(task_id)
+                self._queued_start_prevented.discard(task_id)
                 self._lease_heartbeats.pop(task_id, None)
             deactivate(context_id)
             if task.get("cancel_requested_at") is not None and task.get("dispatched_at") is None:
@@ -1647,14 +1719,22 @@ class A2AAdapter(BasePlatformAdapter):
                 await start_gate.wait()
                 await self.handle_message(event)
             finally:
-                # BasePlatformAdapter.handle_message registers the background
-                # owner before it returns. Retain that exact Task even after
-                # the base map removes it; absence before this handoff is never
-                # treated as proof that queued execution cannot still start.
-                owner = self._session_tasks.get(session_key)
+                wrapper_owner = asyncio.current_task()
+                current_owner = self._session_tasks.get(session_key)
+                queued_event = self._pending_messages.get(session_key)
                 with self._pending_lock:
-                    if owner is not None:
-                        self._owned_session_tasks[task_id] = owner
+                    if (
+                        task_id not in self._event_execution_started
+                        and current_owner is None
+                        and queued_event is None
+                    ):
+                        # Custom/test adapters may implement handle_message as
+                        # the complete execution rather than spawning Base's
+                        # background task. Bind that exact wrapper explicitly.
+                        self._event_execution_started.add(task_id)
+                        self._event_execution_finished.add(task_id)
+                        if wrapper_owner is not None:
+                            self._owned_session_tasks[task_id] = wrapper_owner
                     self._dispatch_handoff_complete.add(task_id)
 
         try:
@@ -1670,6 +1750,7 @@ class A2AAdapter(BasePlatformAdapter):
                     # have started even if cancellation prevents the coroutine
                     # from reaching its finally block.
                     self._dispatch_handoff_complete.add(task_id)
+                    self._queued_start_prevented.add(task_id)
             if stop_before_start:
                 dispatch_future.cancel()
             else:
@@ -1685,6 +1766,9 @@ class A2AAdapter(BasePlatformAdapter):
                 self._dispatch_stop_requested.discard(task_id)
                 self._dispatch_handoff_complete.discard(task_id)
                 self._owned_session_tasks.pop(task_id, None)
+                self._event_execution_started.discard(task_id)
+                self._event_execution_finished.discard(task_id)
+                self._queued_start_prevented.discard(task_id)
                 self._lease_heartbeats.pop(task_id, None)
                 self._stream_buffers.pop(context_id, None)
             deactivate(context_id)
@@ -1738,6 +1822,7 @@ class A2AAdapter(BasePlatformAdapter):
                         raise _LeaseLost("execution lease could not be renewed")
                     with self._pending_lock:
                         self._lease_heartbeats[task_id] = time.monotonic()
+            self._wait_for_execution_stop(task_id)
         except _AgentShuttingDown:
             current = self._tasks.get_task(task_id, enforce_capability=False)
             if current is not None and current["state"] not in TERMINAL_STATES:
@@ -1851,6 +1936,9 @@ class A2AAdapter(BasePlatformAdapter):
                     pass
             raise
         finally:
+            with self._pending_lock:
+                if release_authority and not self._execution_stopped_locked(task_id):
+                    release_authority = False
             if release_authority:
                 with self._pending_lock:
                     if self._pending_replies.get(context_id) is fut:
@@ -1863,6 +1951,9 @@ class A2AAdapter(BasePlatformAdapter):
                     self._dispatch_stop_requested.discard(task_id)
                     self._dispatch_handoff_complete.discard(task_id)
                     self._owned_session_tasks.pop(task_id, None)
+                    self._event_execution_started.discard(task_id)
+                    self._event_execution_finished.discard(task_id)
+                    self._queued_start_prevented.discard(task_id)
                     self._lease_heartbeats.pop(task_id, None)
                     self._stream_buffers.pop(context_id, None)
                 deactivate(context_id)

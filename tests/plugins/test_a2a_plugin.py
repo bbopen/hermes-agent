@@ -1589,6 +1589,63 @@ class TestRegistryDispatchConvention:
 # --------------------------------------------------------------------------
 
 class TestReplyCapture:
+    def test_exact_a2a_event_rebinds_owner_after_session_drain_transfer(
+        self, monkeypatch,
+    ):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import (
+            BasePlatformAdapter, MessageEvent, MessageType,
+        )
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        adapter = A2AAdapter(PlatformConfig(enabled=True))
+        task_id = "task-1234567890abcdef"
+        context_id = "ctx-1234567890abcdef"
+        event = MessageEvent(
+            text="queued event", message_type=MessageType.TEXT,
+            source=adapter.build_source(
+                chat_id=context_id, chat_name="a2a:test", chat_type="dm",
+                user_id="peer", user_name="peer", role_authorized=True,
+            ),
+            message_id=task_id,
+        )
+        gate = asyncio.Event()
+
+        async def fake_background(_self, _event, _session_key):
+            await gate.wait()
+
+        monkeypatch.setattr(
+            BasePlatformAdapter, "_process_message_background", fake_background,
+        )
+
+        async def run():
+            old_owner = asyncio.create_task(asyncio.sleep(0))
+            await old_owner
+            dispatch = Future()
+            dispatch.set_result(None)
+            with adapter._pending_lock:
+                adapter._active_tasks[task_id] = context_id
+                adapter._dispatch_futures[task_id] = dispatch
+                adapter._dispatch_handoff_complete.add(task_id)
+                adapter._owned_session_tasks[task_id] = old_owner
+
+            drain_owner = asyncio.create_task(
+                adapter._process_message_background(event, "a2a:ctx-drain"),
+            )
+            await asyncio.sleep(0)
+            with adapter._pending_lock:
+                assert adapter._owned_session_tasks[task_id] is drain_owner
+                assert task_id in adapter._event_execution_started
+                assert not adapter._execution_stopped_locked(task_id)
+
+            gate.set()
+            await drain_owner
+            with adapter._pending_lock:
+                assert task_id in adapter._event_execution_finished
+                assert adapter._execution_stopped_locked(task_id)
+
+        asyncio.run(run())
+
     def test_final_result_admission_uses_exact_wire_encoder_for_ascii_and_emoji(
         self, monkeypatch, tmp_path,
     ):
@@ -1876,6 +1933,7 @@ class TestReplyCapture:
                 adapter._dispatch_futures[task["task_id"]] = dispatch
                 adapter._dispatch_handoff_complete.add(task["task_id"])
                 adapter._owned_session_tasks[task["task_id"]] = session_task
+                adapter._event_execution_started.add(task["task_id"])
             adapter._session_tasks["a2a:ctx-disconnect"] = session_task
 
             async def cancel_session(session_key):
@@ -1884,6 +1942,8 @@ class TestReplyCapture:
                 target.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await target
+                with adapter._pending_lock:
+                    adapter._event_execution_finished.add(task["task_id"])
 
             monkeypatch.setattr(adapter, "cancel_session_processing", cancel_session)
             await adapter.disconnect()
@@ -1934,6 +1994,7 @@ class TestReplyCapture:
                 adapter._dispatch_futures[task["task_id"]] = dispatch
                 adapter._dispatch_handoff_complete.add(task["task_id"])
                 adapter._owned_session_tasks[task["task_id"]] = session_task
+                adapter._event_execution_started.add(task["task_id"])
             adapter._session_tasks["a2a:ctx-unconfirmed"] = session_task
 
             async def cannot_stop(_session_key):
@@ -1949,6 +2010,8 @@ class TestReplyCapture:
             session_task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await session_task
+            with adapter._pending_lock:
+                adapter._event_execution_finished.add(task["task_id"])
             await asyncio.sleep(0.15)
             assert runtime_policy.get("ctx-unconfirmed") is None
             assert task["task_id"] not in adapter._active_tasks
