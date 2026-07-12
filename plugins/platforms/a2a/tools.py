@@ -498,18 +498,29 @@ def _json_value_error(value: Any) -> bool:
                 return True
             continue
         if isinstance(item, str):
-            size += len(item.encode("utf-8"))
+            try:
+                size += len(item.encode("utf-8"))
+            except UnicodeEncodeError:
+                return True
             if size > max_bytes:
                 return True
             continue
         if isinstance(item, list):
-            stack.extend((child, depth + 1) for child in item)
+            if len(item) > max_nodes - nodes - len(stack):
+                return True
+            for child in item:
+                stack.append((child, depth + 1))
             continue
         if isinstance(item, dict):
+            if len(item) > max_nodes - nodes - len(stack):
+                return True
             for key, child in item.items():
                 if not isinstance(key, str):
                     return True
-                size += len(key.encode("utf-8"))
+                try:
+                    size += len(key.encode("utf-8"))
+                except UnicodeEncodeError:
+                    return True
                 if size > max_bytes:
                     return True
                 stack.append((child, depth + 1))
@@ -561,6 +572,8 @@ def _message_schema_error(message: Any) -> bool:
 def _agent_card_error(card: Any) -> str:
     if not isinstance(card, dict):
         return "card must be an object"
+    if _json_value_error(card):
+        return "card exceeds bounded finite JSON limits"
     allowed = {
         "name", "description", "url", "version", "protocolVersion",
         "capabilities", "defaultInputModes", "defaultOutputModes", "skills",
@@ -697,12 +710,22 @@ def a2a_call(args: dict, **_: Any) -> str:
     # Accept common aliases models reach for (observed live: 'agent_name').
     agent = str(args.get("agent") or args.get("agent_name") or args.get("name") or "").strip()
     message = str(args.get("message") or args.get("text") or args.get("task") or "").strip()
-    context_id = str(args.get("context_id") or args.get("contextId") or "").strip()
-    request_identity = str(args.get("request_id") or args.get("requestId") or "").strip()
+    context_raw = args.get("context_id")
+    if context_raw is None:
+        context_raw = args.get("contextId")
+    context_id = "" if context_raw is None else str(context_raw)
+    request_raw = args.get("request_id")
+    if request_raw is None:
+        request_raw = args.get("requestId")
+    request_identity = "" if request_raw is None else str(request_raw)
     on_behalf_of = str(args.get("on_behalf_of") or "").strip()
     capability = str(args.get("capability") or "").strip()
     if not agent or not message:
         return "Error: both 'agent' and 'message' are required."
+    if context_raw is not None and not isinstance(context_raw, str):
+        return "Error: context_id must be a string."
+    if request_raw is not None and not isinstance(request_raw, str):
+        return "Error: request_id must be a string."
     unsafe = _unsafe_metadata_field("agent", agent)
     if unsafe:
         return unsafe

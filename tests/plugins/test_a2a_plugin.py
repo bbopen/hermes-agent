@@ -991,6 +991,36 @@ class TestClientTools:
         task["metadata"] = {str(index): index for index in range(10_001)}
         assert tools._jsonrpc_response_error(protocol.jsonrpc_result("rpc", task))
 
+    def test_raw_external_ids_are_never_normalized(self):
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        params = {"message": protocol.text_message(
+            "user", "x", message_id="valid-id\n",
+        )}
+        assert A2AAdapter._request_key(params, "rpc") == ""
+        params["message"]["contextId"] = "valid-id\n"
+        with pytest.raises(ValueError):
+            A2AAdapter._context_id(params)
+
+    def test_bounded_json_rejects_surrogates_cycles_and_wide_fanout(self):
+        assert tools._json_value_error({"bad": "\ud800"})
+        assert tools._json_value_error({"\ud800": "bad"})
+        cyclic = {}
+        cyclic["self"] = cyclic
+        assert tools._json_value_error(cyclic)
+        assert tools._json_value_error([None] * 500_000)
+
+    def test_agent_card_uses_bounded_json_validation(self):
+        card = protocol.build_agent_card(
+            name="x", url="http://localhost/", description="x",
+        )
+        card["securitySchemes"] = {"deep": {}}
+        cursor = card["securitySchemes"]["deep"]
+        for _ in range(300):
+            cursor["child"] = {}
+            cursor = cursor["child"]
+        assert tools._agent_card_error(card)
+
     @pytest.mark.parametrize(
         "url",
         ["not-a-url", "http://user:pass@host/", "http://host/?token=secret", "http://169.254.169.254/"],
