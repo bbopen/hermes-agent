@@ -1742,6 +1742,11 @@ class TestReplyCapture:
             )
             await adapter._process_message_background(event, session_key)
             assert called is False
+            monkeypatch.setattr(
+                adapter._tasks, "get_task", lambda *_args, **_kwargs: None,
+            )
+            await adapter._process_message_background(event, session_key)
+            assert called is False
 
         asyncio.run(run())
 
