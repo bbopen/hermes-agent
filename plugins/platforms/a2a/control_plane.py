@@ -489,6 +489,21 @@ class TaskStore:
         finally:
             conn.close()
 
+    def get_task_by_request(
+        self, request_key: str, *, principal: str, on_behalf_of: str, capability: str,
+    ) -> Optional[dict[str, Any]]:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """SELECT tasks.* FROM requests JOIN tasks USING(task_id)
+                   WHERE requests.principal = ? AND requests.on_behalf_of = ?
+                     AND requests.request_key = ? AND tasks.capability = ?""",
+                (principal, on_behalf_of, request_key, capability),
+            ).fetchone()
+            return _row_to_dict(row)
+        finally:
+            conn.close()
+
     @staticmethod
     def _terminalize_locked(
         conn: sqlite3.Connection,

@@ -615,6 +615,31 @@ class A2AAdapter(BasePlatformAdapter):
                     adapter._flush_audit_outbox(task_id)
                     self._json(200, protocol.jsonrpc_result(req_id, task_to_wire(task)))
                     return
+                if method == "tasks/getByRequest":
+                    policy, denial = adapter._request_policy(params, identity)
+                    if denial:
+                        self._json(403, protocol.jsonrpc_error(req_id, -32003, denial))
+                        return
+                    request_key = str(params.get("requestId") or "").strip()
+                    if not _safe_external_id(request_key):
+                        self._json(400, protocol.jsonrpc_error(
+                            req_id, -32602, "valid requestId is required",
+                        ))
+                        return
+                    task = adapter._tasks.get_task_by_request(
+                        request_key,
+                        principal=policy.principal,
+                        on_behalf_of=policy.on_behalf_of,
+                        capability=policy.capability,
+                    )
+                    if task is None:
+                        self._json(404, protocol.jsonrpc_error(
+                            req_id, -32004, "task not found",
+                        ))
+                        return
+                    adapter._flush_audit_outbox(task["task_id"])
+                    self._json(200, protocol.jsonrpc_result(req_id, task_to_wire(task)))
+                    return
                 if method == "tasks/cancel":
                     policy, denial = adapter._request_policy(params, identity)
                     if denial:
@@ -1322,7 +1347,7 @@ class A2AAdapter(BasePlatformAdapter):
                             lease_owner=self._instance_id,
                             incarnation=int(current["incarnation"]),
                         )
-                    except ControlPlaneError:
+                    except Exception:
                         logger.error("A2A: could not persist final reply for task %s", task_id,
                                      exc_info=True)
                         fut.set_exception(_TaskInterrupted("durable task completion failed"))

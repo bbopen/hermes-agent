@@ -243,10 +243,19 @@ def validate_inbound_config(extra: Mapping[str, Any]) -> str:
                 return "trusted_peers keys must be non-empty strings"
             if not isinstance(raw, Mapping):
                 return f"trusted_peers.{principal} must be a mapping"
+            allowed_peer_fields = {
+                "enabled", "credentials", "on_behalf_of", "capabilities",
+                "token_env", "key_id", "expires_at", "revoked",
+            }
+            unknown_peer_fields = set(raw) - allowed_peer_fields
+            if unknown_peer_fields:
+                return f"trusted_peers.{principal} has unknown fields"
             if "enabled" in raw and type(raw["enabled"]) is not bool:
                 return f"trusted_peers.{principal}.enabled must be a boolean"
             credentials = raw.get("credentials")
             if credentials is not None:
+                if any(field in raw for field in ("token_env", "key_id", "expires_at", "revoked")):
+                    return f"trusted_peers.{principal} cannot mix credentials with legacy fields"
                 if not isinstance(credentials, list) or not credentials:
                     return f"trusted_peers.{principal}.credentials must be a non-empty list"
                 allowed_fields = {"key_id", "id", "token_env", "expires_at", "revoked"}
@@ -258,8 +267,18 @@ def validate_inbound_config(extra: Mapping[str, Any]) -> str:
                             not isinstance(credential[field], str) or not credential[field].strip()
                         ):
                             return f"trusted_peers.{principal}.credentials[{index}].{field} must be a string"
+                    if sum(field in credential for field in ("key_id", "id")) != 1:
+                        return f"trusted_peers.{principal}.credentials[{index}] needs exactly one key identifier"
+                    if "token_env" not in credential:
+                        return f"trusted_peers.{principal}.credentials[{index}].token_env is required"
                     if "revoked" in credential and type(credential["revoked"]) is not bool:
                         return f"trusted_peers.{principal}.credentials[{index}].revoked must be boolean"
+                    if "expires_at" in credential:
+                        expires = credential["expires_at"]
+                        if isinstance(expires, bool) or not isinstance(expires, (str, int, float)):
+                            return f"trusted_peers.{principal}.credentials[{index}].expires_at is invalid"
+                        if _expires_at(expires) == -1.0:
+                            return f"trusted_peers.{principal}.credentials[{index}].expires_at is invalid"
             for field in ("on_behalf_of", "capabilities"):
                 values = raw.get(field)
                 if not isinstance(values, list) or not values or any(

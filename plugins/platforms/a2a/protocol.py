@@ -30,7 +30,9 @@ STATE_FAILED = "failed"
 STATE_CANCELED = "canceled"
 
 PROTOCOL_VERSION = "0.3"
-SUPPORTED_METHODS = frozenset({"message/send", "tasks/get", "tasks/cancel"})
+SUPPORTED_METHODS = frozenset({
+    "message/send", "tasks/get", "tasks/getByRequest", "tasks/cancel",
+})
 
 
 # --------------------------------------------------------------------------

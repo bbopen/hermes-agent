@@ -77,6 +77,12 @@ A2A is deliberately synchronous (`supports_async_delivery: false`): the HTTP
 task remains durable and queryable through `tasks/get`, including progress and
 its terminal completion, but Hermes does not promise a push after that request
 channel has closed. Callers must poll the durable task when they detach.
+Use a stable message `messageId` (the `a2a_call` tool exposes this as
+`request_id`) and call authenticated `tasks/getByRequest` with that identity
+plus the same OBO/capability metadata. This returns the same standard Task and
+opaque `taskId` across dropped responses, retries, and gateway restarts without
+re-executing the request; other principals receive the same not-found result as
+an absent task.
 
 ## Security
 

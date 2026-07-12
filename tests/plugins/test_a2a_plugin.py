@@ -941,6 +941,24 @@ class TestClientTools:
         assert tools._jsonrpc_response_error({"jsonrpc": "2.0", "id": "x", "error": {"code": True, "message": "bad"}})
         monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": ["peer"]})
         assert tools.a2a_list().startswith("Error:")
+        assert tools._agent_card_error({"name": "x"})
+        malformed_task = {
+            "jsonrpc": "2.0", "id": "x",
+            "result": {"status": {"state": 7}, "artifacts": {}},
+        }
+        assert tools._jsonrpc_response_error(malformed_task)
+
+    @pytest.mark.parametrize(
+        "url",
+        ["not-a-url", "http://user:pass@host/", "http://host/?token=secret", "http://169.254.169.254/"],
+    )
+    def test_list_rejects_unsafe_peer_urls_without_echo(self, monkeypatch, url):
+        monkeypatch.setattr(tools, "_load_config", lambda: {
+            "a2a_agents": {"peer": {"url": url}}
+        })
+        output = tools.a2a_list()
+        assert output.startswith("Error:")
+        assert "pass" not in output and "token=secret" not in output
 
     def test_metadata_and_link_local_addresses_are_never_permitted(self, monkeypatch):
         monkeypatch.setattr(tools, "_load_config", lambda: {
@@ -974,7 +992,10 @@ class TestClientTools:
         card = protocol.build_agent_card(
             name="researcher", url="http://localhost:9999/",
             description="finds things",
-            skills=[{"id": "s", "name": "search", "description": "web search"}],
+            skills=[{
+                "id": "s", "name": "search", "description": "web search",
+                "tags": ["search"],
+            }],
         )
         monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: card)
         out = tools.a2a_discover({"url": "http://localhost:9999"})
@@ -1232,6 +1253,19 @@ class TestRegistryDispatchConvention:
 # --------------------------------------------------------------------------
 
 class TestReplyCapture:
+    def test_final_persistence_failure_fails_send_and_waiter(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        adapter = A2AAdapter(PlatformConfig(enabled=True))
+        future = Future()
+        adapter._pending_replies["ctx-missing"] = future
+        adapter._pending_tasks["ctx-missing"] = "task-does-not-exist"
+        result = asyncio.run(adapter.send(
+            "ctx-missing", "final", metadata={"notify": True},
+        ))
+        assert result.success is False
+        assert future.done() and future.exception() is not None
     def test_stream_cursor_preview_plus_final_delta_is_exact(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.a2a.adapter import A2AAdapter
@@ -1973,6 +2007,22 @@ class TestPrincipalBoundTaskHTTP:
                         "params": {"taskId": task_id, "metadata": metadata}}
             fetched = await asyncio.to_thread(post, get_body, "token-a", "a-current")
             assert fetched["result"] == task
+            lookup_body = {
+                "jsonrpc": "2.0", "id": "rpc-lookup",
+                "method": "tasks/getByRequest",
+                "params": {"requestId": message["messageId"], "metadata": metadata},
+            }
+            looked_up = await asyncio.to_thread(
+                post, lookup_body, "token-a", "a-current",
+            )
+            assert looked_up["result"] == task
+            assert TaskStore(adapter._tasks.path).get_task_by_request(
+                message["messageId"], principal="peer-a", on_behalf_of="brett",
+                capability="system.proof",
+            )["task_id"] == task_id
+            with pytest.raises(urllib.error.HTTPError) as hidden_lookup:
+                await asyncio.to_thread(post, lookup_body, "token-b", "b-current")
+            assert hidden_lookup.value.code == 404
 
             hidden_errors = []
             for hidden_task_id in (task_id, "task-does-not-exist"):
