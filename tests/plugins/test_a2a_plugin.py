@@ -762,6 +762,36 @@ class TestDurableControlPlane:
         assert emitted is True and terminal["state"] == protocol.STATE_CANCELED
         assert store.terminal_event_count(task["task_id"]) == 1
 
+    def test_internal_error_stop_reason_is_durable_and_invalid_reasons_reject(
+        self, monkeypatch, tmp_path,
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        store = TaskStore()
+        task, _ = self._claim(store, request="internal-stop")
+        task, dispatched = store.mark_dispatched(
+            task["task_id"], owner="instance-a",
+            incarnation=task["incarnation"], lease_seconds=60,
+        )
+        assert dispatched is True
+
+        with pytest.raises(ValueError, match="invalid stop reason"):
+            store.request_stop(
+                task["task_id"], reason="arbitrary-reason",
+                backstop="untrusted.backstop",
+            )
+        unchanged = store.get_task(task["task_id"], enforce_capability=False)
+        assert unchanged["stop_requested_at"] is None
+        assert unchanged["stop_reason"] == ""
+        assert unchanged["cancellation_backstop"] == ""
+
+        stopped = store.request_stop(
+            task["task_id"], reason="internal-error",
+            backstop="gateway.cancel_session_processing",
+        )
+        assert stopped["stop_requested_at"] is not None
+        assert stopped["stop_reason"] == "internal-error"
+        assert stopped["cancellation_backstop"] == "gateway.cancel_session_processing"
+
     def test_context_has_one_cross_process_unfinished_execution(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         self._claim(TaskStore(), request="first", context="ctx-serialized")
@@ -3251,6 +3281,20 @@ class TestInboundRoundTrip:
                 assert "failed" in result
                 assert executions and len(executions) == 1
                 assert renew_calls == 1
+                stored = adapter._tasks.get_task(
+                    executions[0], enforce_capability=False,
+                )
+                assert stored["stop_requested_at"] is not None
+                assert stored["stop_reason"] == "internal-error"
+                assert stored["cancellation_backstop"] == (
+                    "gateway.cancel_session_processing"
+                )
+                assert (
+                    stored["state"] == protocol.STATE_FAILED
+                    or stored["execution_uncertain_at"] is not None
+                )
+                assert executions[0] not in adapter._active_tasks
+                assert runtime_policy.get(stored["context_id"]) is None
             finally:
                 await adapter.disconnect()
 

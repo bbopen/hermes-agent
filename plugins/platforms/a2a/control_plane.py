@@ -52,6 +52,14 @@ TERMINAL_STATES = frozenset({
     protocol.STATE_CANCELED,
 })
 
+_DURABLE_STOP_REASONS = frozenset({
+    "deadline",
+    "timeout",
+    "shutdown",
+    "lease-lost",
+    "internal-error",
+})
+
 _VALID_TRANSITIONS = {
     protocol.STATE_SUBMITTED: frozenset({
         protocol.STATE_WORKING, protocol.STATE_FAILED, protocol.STATE_CANCELED,
@@ -727,8 +735,8 @@ class TaskStore:
             conn.close()
 
     def request_stop(self, task_id: str, *, reason: str, backstop: str) -> Optional[dict[str, Any]]:
-        """Record a deadline/timeout stop request without asserting its outcome."""
-        if reason not in {"deadline", "timeout", "shutdown", "lease-lost"}:
+        """Record a bounded execution stop request without asserting its outcome."""
+        if reason not in _DURABLE_STOP_REASONS:
             raise ValueError("invalid stop reason")
         now = time.time()
         conn = self._connect()
