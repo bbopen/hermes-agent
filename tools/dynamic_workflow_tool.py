@@ -141,9 +141,11 @@ def _normalise_nodes(raw_nodes: Any) -> Tuple[List[Dict[str, Any]], List[str]]:
             issues.append(f"node {node_id} cannot depend on itself")
             continue
 
-        toolsets, toolsets_issue = _as_string_list(raw.get("toolsets"), field=f"nodes[{index}].toolsets")
-        if toolsets_issue:
-            issues.append(toolsets_issue)
+        if raw.get("toolsets") is not None:
+            issues.append(
+                f"nodes[{index}].toolsets is not supported; workflow workers "
+                "inherit the parent's delegated tool capabilities"
+            )
             continue
 
         phase_title = _cap_text(raw.get("phase_title") or raw.get("phase"))
@@ -170,7 +172,6 @@ def _normalise_nodes(raw_nodes: Any) -> Tuple[List[Dict[str, Any]], List[str]]:
                 "goal": goal,
                 "context": _cap_text(raw.get("context")),
                 "depends_on": depends_on,
-                "toolsets": toolsets or None,
                 "role": _normalise_role(raw.get("role")),
                 "status": "pending",
                 "delegation_id": None,
@@ -252,6 +253,37 @@ def _node_status_from_async(status: Any) -> Optional[str]:
     return None
 
 
+def _apply_async_record(node: Dict[str, Any], record: Dict[str, Any]) -> bool:
+    """Apply one terminal async-delegation record to its workflow node."""
+    delegation_id = str(record.get("delegation_id") or "").strip()
+    if not delegation_id or node.get("delegation_id") != delegation_id:
+        return False
+    next_status = _node_status_from_async(record.get("status"))
+    if not next_status:
+        return False
+
+    node["status"] = next_status
+    node["summary"] = _cap_text(record.get("summary"))
+    node["error"] = _cap_text(record.get("error")) if record.get("error") else None
+    node["completed_at"] = record.get("completed_at") or _now()
+    for key in (
+        "duration_seconds",
+        "api_calls",
+        "input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "cost_usd",
+        "exit_reason",
+        "model",
+    ):
+        if key in record and record.get(key) is not None:
+            node[key] = record.get(key)
+    node["async_completion_reconciled"] = True
+    node["updated_at"] = _now()
+    _reconciled_async_delegations.add(delegation_id)
+    return True
+
+
 def _reconcile_async_delegations(workflow: Dict[str, Any]) -> List[str]:
     """Refresh dispatched workflow nodes from retained async delegation records."""
     dispatched = {
@@ -276,31 +308,8 @@ def _reconcile_async_delegations(workflow: Dict[str, Any]) -> List[str]:
         node = dispatched.get(delegation_id)
         if not node:
             continue
-        next_status = _node_status_from_async(record.get("status"))
-        if not next_status:
-            continue
-
-        node["status"] = next_status
-        node["summary"] = _cap_text(record.get("summary"))
-        node["error"] = _cap_text(record.get("error")) if record.get("error") else None
-        node["completed_at"] = record.get("completed_at") or _now()
-        for key in (
-            "duration_seconds",
-            "api_calls",
-            "input_tokens",
-            "output_tokens",
-            "reasoning_tokens",
-            "cost_usd",
-            "exit_reason",
-            "model",
-        ):
-            if key in record and record.get(key) is not None:
-                node[key] = record.get(key)
-        node["async_completion_reconciled"] = True
-        node["updated_at"] = _now()
-        if delegation_id:
-            _reconciled_async_delegations.add(str(delegation_id))
-        updated.append(node["node_id"])
+        if _apply_async_record(node, record):
+            updated.append(node["node_id"])
 
     if updated:
         workflow["updated_at"] = _now()
@@ -447,13 +456,23 @@ def _dispatch_ready(workflow: Dict[str, Any], parent_agent: Any, max_dispatch: i
         node = workflow["nodes"][node_id]
         from tools import delegate_tool
 
+        def _on_complete(record: Dict[str, Any], *, _node_id: str = node_id) -> None:
+            with _workflows_lock:
+                key = (workflow["scope"], workflow["workflow_id"])
+                current = _workflows.get(key)
+                if current is not workflow:
+                    return
+                current_node = current["nodes"].get(_node_id)
+                if current_node and _apply_async_record(current_node, record):
+                    current["updated_at"] = _now()
+
         raw = delegate_tool.delegate_task(
             goal=node["goal"],
             context=_worker_context(workflow, node),
-            toolsets=node.get("toolsets"),
             role=node.get("role") or "leaf",
             background=True,
             parent_agent=parent_agent,
+            _completion_callback=_on_complete,
             _observability_context={
                 "workflow_id": workflow["workflow_id"],
                 "workflow_node_id": node_id,
@@ -724,11 +743,6 @@ DYNAMIC_WORKFLOW_SCHEMA = {
                             "type": "array",
                             "items": {"type": "string"},
                             "description": "Node ids that must complete before this node is ready.",
-                        },
-                        "toolsets": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Toolsets to enable for this node's delegated worker.",
                         },
                         "role": {
                             "type": "string",

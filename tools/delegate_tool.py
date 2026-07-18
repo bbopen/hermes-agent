@@ -28,7 +28,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
 )
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from toolsets import TOOLSETS
 
@@ -2118,6 +2118,7 @@ def delegate_task(
     background: Optional[bool] = None,
     parent_agent=None,
     _observability_context: Optional[Dict[str, Any]] = None,
+    _completion_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -2362,6 +2363,7 @@ def delegate_task(
                 session_key=_session_key,
                 runner=_async_runner,
                 interrupt_fn=_async_interrupt,
+                completion_callback=_completion_callback,
                 max_async_children=_get_max_async_children(),
                 observability_context=observability_context,
             )

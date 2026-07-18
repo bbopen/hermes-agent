@@ -127,6 +127,34 @@ def test_completion_event_lands_on_shared_queue_with_session_key():
     assert retained["model"] == "test-model"
 
 
+def test_completion_callback_runs_before_record_can_be_pruned():
+    completed = []
+
+    res = ad.dispatch_async_delegation(
+        goal="owned work",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="test-model",
+        session_key="",
+        runner=lambda: {"status": "completed", "summary": "owned result"},
+        completion_callback=completed.append,
+        max_async_children=3,
+    )
+
+    assert _drain_one() is not None
+    assert len(completed) == 1
+    assert completed[0]["delegation_id"] == res["delegation_id"]
+    assert completed[0]["status"] == "completed"
+    assert completed[0]["summary"] == "owned result"
+    retained = next(
+        item
+        for item in ad.list_async_delegations()
+        if item["delegation_id"] == res["delegation_id"]
+    )
+    assert "completion_callback" not in retained
+
+
 def test_completion_event_preserves_workflow_observability_context():
     def runner():
         return {"status": "completed", "summary": "done"}
@@ -339,6 +367,7 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     fake_child._subagent_id = "s1"
 
     gate = threading.Event()
+    completed = []
 
     def slow_child(task_index, goal, child=None, parent_agent=None, **kw):
         gate.wait(timeout=5)  # a sync impl would hang delegate_task here
@@ -358,6 +387,7 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
         out = dt.delegate_task(
             goal="the real task", context="ctx", toolsets=["web"],
             background=True, parent_agent=parent,
+            _completion_callback=completed.append,
         )
 
     import json
@@ -378,6 +408,8 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert evt is not None
     assert evt["type"] == "async_delegation"
     assert evt["summary"] == "done: the real task"
+    assert completed[0]["delegation_id"] == parsed["delegation_id"]
+    assert completed[0]["summary"] == "done: the real task"
     text = format_process_notification(evt)
     assert text is not None
     assert "the real task" in text and "ctx" in text

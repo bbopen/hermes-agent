@@ -171,6 +171,7 @@ def dispatch_async_delegation(
     session_key: str,
     runner: Callable[[], Dict[str, Any]],
     interrupt_fn: Optional[Callable[[], None]] = None,
+    completion_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     observability_context: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
@@ -192,6 +193,10 @@ def dispatch_async_delegation(
     interrupt_fn
         Optional callable to signal the child to stop (used on shutdown /
         explicit cancel).
+    completion_callback
+        Optional internal callback invoked with the finalized record before
+        retention pruning. Used by owners that need authoritative lifecycle
+        state without polling the bounded recent-record list.
     max_async_children
         Concurrency cap. When at capacity the dispatch is REJECTED (the caller
         should fall back to sync or tell the user) rather than queued, so a
@@ -219,6 +224,7 @@ def dispatch_async_delegation(
         "dispatched_at": dispatched_at,
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
+        "completion_callback": completion_callback,
     }
     if observability_context:
         record["observability_context"] = dict(observability_context)
@@ -310,10 +316,17 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
             if key in result and result.get(key) is not None:
                 record[key] = result.get(key)
         record["interrupt_fn"] = None  # drop the closure; child is done
+        completion_callback = record.get("completion_callback")
+        record["completion_callback"] = None
         # Snapshot fields needed for the event while holding the lock.
         event_record = dict(record)
         _prune_completed_locked()
 
+    if callable(completion_callback):
+        try:
+            completion_callback(event_record)
+        except Exception:
+            logger.exception("Async delegation %s completion callback failed", delegation_id)
     _push_completion_event(event_record, result, status)
 
 
@@ -382,7 +395,11 @@ def list_async_delegations() -> List[Dict[str, Any]]:
     """
     with _records_lock:
         return [
-            {k: v for k, v in r.items() if k != "interrupt_fn"}
+            {
+                k: v
+                for k, v in r.items()
+                if k not in {"interrupt_fn", "completion_callback"}
+            }
             for r in _records.values()
         ]
 

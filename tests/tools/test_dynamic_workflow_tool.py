@@ -153,7 +153,6 @@ def test_dispatch_ready_uses_delegate_task_background(monkeypatch):
                     "phase_title": "Investigate",
                     "title": "Web source review",
                     "goal": "Search web sources",
-                    "toolsets": ["web"],
                 },
                 {
                     "node_id": "files",
@@ -161,7 +160,6 @@ def test_dispatch_ready_uses_delegate_task_background(monkeypatch):
                     "phase_title": "Investigate",
                     "title": "Local note review",
                     "goal": "Inspect local notes",
-                    "toolsets": ["file"],
                 },
             ],
         },
@@ -188,7 +186,8 @@ def test_dispatch_ready_uses_delegate_task_background(monkeypatch):
     assert "node_id: web" in calls[0]["context"]
     assert "phase: Investigate" in calls[0]["context"]
     assert "task_title: Web source review" in calls[0]["context"]
-    assert calls[0]["toolsets"] == ["web"]
+    assert "toolsets" not in calls[0]
+    assert callable(calls[0]["_completion_callback"])
     assert calls[0]["_observability_context"] == {
         "workflow_id": "wf_dispatch",
         "workflow_node_id": "web",
@@ -201,6 +200,26 @@ def test_dispatch_ready_uses_delegate_task_background(monkeypatch):
     }
     assert result["workflow"]["nodes"][0]["status"] == "dispatched"
     assert result["workflow"]["nodes"][0]["subagent_id"] == "sa_1"
+
+
+def test_create_rejects_per_node_toolset_override():
+    result = _call(
+        {
+            "action": "create",
+            "workflow_id": "wf_restricted",
+            "objective": "Do not widen delegated capabilities",
+            "nodes": [
+                {
+                    "node_id": "worker",
+                    "goal": "Inspect files",
+                    "toolsets": ["terminal"],
+                }
+            ],
+        }
+    )
+
+    assert "error" in result
+    assert "toolsets is not supported" in result["error"]
 
 
 def test_record_result_then_model_can_extend_graph_with_dependent_node():
@@ -351,6 +370,46 @@ def test_status_reconciles_completed_async_workflow_node(monkeypatch):
         )
         is True
     )
+
+
+def test_completion_callback_survives_recent_record_eviction(monkeypatch):
+    callbacks = []
+
+    def fake_delegate_task(**kwargs):
+        callbacks.append(kwargs["_completion_callback"])
+        return json.dumps({"status": "dispatched", "delegation_id": "deleg_evicted"})
+
+    from tools import delegate_tool
+    import tools.async_delegation as ad
+
+    monkeypatch.setattr(delegate_tool, "delegate_task", fake_delegate_task)
+    monkeypatch.setattr(ad, "list_async_delegations", lambda: [])
+
+    _call(
+        {
+            "action": "create",
+            "workflow_id": "wf_callback",
+            "objective": "Retain authoritative completion",
+            "dispatch_ready": True,
+            "nodes": [{"node_id": "worker", "goal": "Do work"}],
+        },
+        parent_agent=object(),
+    )
+    callbacks[0](
+        {
+            "delegation_id": "deleg_evicted",
+            "status": "completed",
+            "summary": "Finished before bounded-record eviction.",
+            "completed_at": 456.0,
+        }
+    )
+
+    status = _call({"action": "status", "workflow_id": "wf_callback"})
+    node = status["workflow"]["nodes"][0]
+    assert status["workflow"]["status"] == "completed"
+    assert node["summary"] == "Finished before bounded-record eviction."
+    assert node["completed_at"] == 456.0
+    assert node["async_completion_reconciled"] is True
 
 
 def test_dispatch_ready_unlocks_dependents_after_async_reconcile(monkeypatch):
