@@ -623,8 +623,18 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
 
         # At-most-once claim: bail without running if a tick/other fire owns it.
         if not claim_job_for_fire(job_id):
-            return {"claimed": False, "success": False,
-                    "error": "Job is already being fired by the scheduler; not run again."}
+            # claim_job_for_fire returns False for paused/disabled/missing
+            # jobs too — don't mislabel those as "already being fired"
+            # (#60703): that message sends the user chasing a phantom
+            # in-flight run when the job simply isn't runnable.
+            refreshed = get_job(job_id)
+            if refreshed is None:
+                reason = "Job no longer exists; nothing to run."
+            elif not refreshed.get("enabled", True) or refreshed.get("state") == "paused":
+                reason = "Job is paused/disabled; resume it before running."
+            else:
+                reason = "Job is already being fired by the scheduler; not run again."
+            return {"claimed": False, "success": False, "error": reason}
 
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
@@ -837,7 +847,7 @@ def cronjob(
             result["executed"] = exec_result.get("claimed", False)
             result["execution_success"] = exec_result.get("success", False)
             if not exec_result.get("claimed", False):
-                result["execution_skipped"] = (
+                result["execution_skipped"] = exec_result.get("error") or (
                     "Already being fired by the scheduler; not run again."
                 )
             elif exec_result.get("error"):
@@ -1089,18 +1099,25 @@ def check_cronjob_requirements() -> bool:
     The cron system is internal (JSON file-based scheduler ticked by the gateway),
     so no external crontab executable is required.
 
-    Session env vars must hold an explicit truthy string (``1``, ``true``,
-    ``yes``, ``on``) — false-like values (``0``, ``false``, ``no``, ``off``)
-    leave the tool disabled. Uses the shared ``env_var_enabled`` helper so
-    every consumer of these flags agrees on the truthy set.
+    Legacy process env vars must hold an explicit truthy string (``1``,
+    ``true``, ``yes``, ``on``). Gateway turns bind their platform identity in
+    ContextVars, so they must not depend on process-global env flags.
     """
     from utils import env_var_enabled
 
-    return (
+    if (
         env_var_enabled("HERMES_INTERACTIVE")
         or env_var_enabled("HERMES_GATEWAY_SESSION")
         or env_var_enabled("HERMES_EXEC_ASK")
-    )
+    ):
+        return True
+
+    try:
+        from gateway.session_context import get_session_env
+
+        return bool(get_session_env("HERMES_SESSION_PLATFORM", ""))
+    except Exception:
+        return False
 
 
 # --- Registry ---
@@ -1133,5 +1150,6 @@ registry.register(
         task_id=kw.get("task_id"),
     ))(),
     check_fn=check_cronjob_requirements,
+    check_fn_session_scoped=True,
     emoji="⏰",
 )

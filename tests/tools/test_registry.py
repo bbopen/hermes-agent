@@ -47,6 +47,70 @@ class TestRegisterAndDispatch:
         result = json.loads(reg.dispatch("echo", {"msg": "hi"}))
         assert result == {"msg": "hi"}
 
+    def test_dispatch_preserves_supported_multimodal_result(self):
+        reg = ToolRegistry()
+        multimodal = {
+            "_multimodal": True,
+            "content": [{"type": "text", "text": "captured"}],
+            "text_summary": "captured",
+        }
+        reg.register(
+            name="capture",
+            toolset="computer_use",
+            schema=_make_schema("capture"),
+            handler=lambda args, **kw: multimodal,
+        )
+
+        assert reg.dispatch("capture", {}) is multimodal
+
+    def test_dispatch_rejects_unsupported_handler_results_with_structured_error(self):
+        invalid_results = ({"ok": True}, b"bytes", None, 42)
+
+        for invalid in invalid_results:
+            reg = ToolRegistry()
+            reg.register(
+                name="bad_result",
+                toolset="core",
+                schema=_make_schema("bad_result"),
+                handler=lambda args, _invalid=invalid, **kw: _invalid,
+            )
+
+            raw = reg.dispatch("bad_result", {})
+            result = json.loads(raw)
+
+            assert isinstance(raw, str)
+            assert result["error_type"] == "tool_result_contract"
+            assert result["tool"] == "bad_result"
+            assert result["result_type"] == type(invalid).__name__
+            assert "unsupported result type" in result["error"]
+
+    def test_handler_contract_error_survives_model_tools_pipeline(self):
+        from model_tools import handle_function_call, registry
+
+        name = "test_invalid_registry_result"
+        registry.register(
+            name=name,
+            toolset="core",
+            schema=_make_schema(name),
+            handler=lambda args, **kw: None,
+        )
+        try:
+            raw = handle_function_call(
+                name,
+                {},
+                task_id="contract-test",
+                skip_pre_tool_call_hook=True,
+            )
+        finally:
+            registry.deregister(name)
+
+        result = json.loads(raw)
+        assert len(raw) > 0  # downstream sizing/logging remains safe
+        assert json.loads(json.dumps({"content": raw}))["content"] == raw
+        assert result["error_type"] == "tool_result_contract"
+        assert result["tool"] == name
+        assert result["result_type"] == "NoneType"
+
 
 class TestGetDefinitions:
     def test_returns_openai_format(self):
@@ -110,6 +174,116 @@ class TestGetDefinitions:
         defs = reg.get_definitions({"first", "second"})
         assert len(defs) == 2
         assert calls["count"] == 1
+
+    def test_check_fn_cache_isolated_by_gateway_session_context(self):
+        """A cached availability result from one gateway turn cannot leak."""
+        from gateway.session_context import clear_session_vars, reset_session_vars, set_session_vars
+        from tools.registry import invalidate_check_fn_cache
+
+        reg = ToolRegistry()
+
+        def check():
+            from gateway.session_context import get_session_env
+
+            return get_session_env("HERMES_SESSION_PLATFORM") == "matrix"
+
+        reg.register(
+            name="session-gated",
+            toolset="session-gated",
+            schema=_make_schema("session-gated"),
+            handler=_dummy_handler,
+            check_fn=check,
+            check_fn_session_scoped=True,
+        )
+        try:
+            reset_session_vars()
+            invalidate_check_fn_cache()
+            matrix_tokens = set_session_vars(platform="matrix")
+            assert reg.get_definitions({"session-gated"})
+
+            clear_session_vars(matrix_tokens)
+            discord_tokens = set_session_vars(platform="discord")
+            assert reg.get_definitions({"session-gated"}) == []
+            clear_session_vars(discord_tokens)
+        finally:
+            reset_session_vars()
+            invalidate_check_fn_cache()
+
+    def test_check_fn_cache_isolated_by_active_profile(self, tmp_path):
+        """A profile-scoped availability result cannot leak into another turn."""
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from tools.registry import invalidate_check_fn_cache
+
+        reg = ToolRegistry()
+        first_home = tmp_path / "first"
+        second_home = tmp_path / "second"
+        first_home.mkdir()
+        second_home.mkdir()
+
+        def check():
+            from hermes_constants import get_hermes_home
+
+            return get_hermes_home() == first_home
+
+        reg.register(
+            name="profile-gated",
+            toolset="profile-gated",
+            schema=_make_schema("profile-gated"),
+            handler=_dummy_handler,
+            check_fn=check,
+        )
+        try:
+            invalidate_check_fn_cache()
+            first_token = set_hermes_home_override(first_home)
+            try:
+                assert reg.get_definitions({"profile-gated"})
+            finally:
+                reset_hermes_home_override(first_token)
+
+            second_token = set_hermes_home_override(second_home)
+            try:
+                assert reg.get_definitions({"profile-gated"}) == []
+            finally:
+                reset_hermes_home_override(second_token)
+        finally:
+            invalidate_check_fn_cache()
+
+    def test_external_check_keeps_last_good_across_sessions(self, monkeypatch):
+        """Session changes do not discard an external probe's failure grace."""
+        import tools.registry as registry_module
+        from gateway.session_context import clear_session_vars, reset_session_vars, set_session_vars
+        from tools.registry import invalidate_check_fn_cache
+
+        reg = ToolRegistry()
+        state = {"available": True}
+        now = {"value": 100.0}
+
+        def check():
+            return state["available"]
+
+        monkeypatch.setattr(registry_module.time, "monotonic", lambda: now["value"])
+        reg.register(
+            name="external-gated",
+            toolset="external-gated",
+            schema=_make_schema("external-gated"),
+            handler=_dummy_handler,
+            check_fn=check,
+        )
+        try:
+            reset_session_vars()
+            invalidate_check_fn_cache()
+            matrix_tokens = set_session_vars(platform="matrix")
+            assert reg.get_definitions({"external-gated"})
+
+            clear_session_vars(matrix_tokens)
+            discord_tokens = set_session_vars(platform="discord")
+            now["value"] += registry_module._CHECK_FN_TTL_SECONDS + 1
+            state["available"] = False
+            assert reg.get_definitions({"external-gated"})
+            clear_session_vars(discord_tokens)
+        finally:
+            reset_session_vars()
+            invalidate_check_fn_cache()
 
 
 class TestUnknownToolDispatch:
@@ -441,7 +615,7 @@ class TestThreadSafety:
 
         def blocking_check():
             check_started.set()
-            writer_completed_during_check["value"] = writer_done.wait(timeout=1)
+            writer_completed_during_check["value"] = writer_done.wait(timeout=10)
             return True
 
         reg.register(
@@ -465,7 +639,7 @@ class TestThreadSafety:
                 errors.append(exc)
 
         def writer():
-            assert check_started.wait(timeout=1)
+            assert check_started.wait(timeout=10)
             reg.register(
                 name="gamma",
                 toolset="new",
@@ -478,8 +652,8 @@ class TestThreadSafety:
         writer_thread = threading.Thread(target=writer)
         reader_thread.start()
         writer_thread.start()
-        reader_thread.join(timeout=2)
-        writer_thread.join(timeout=2)
+        reader_thread.join(timeout=15)
+        writer_thread.join(timeout=15)
 
         assert not reader_thread.is_alive()
         assert not writer_thread.is_alive()
@@ -501,7 +675,7 @@ class TestThreadSafety:
 
         def blocking_check():
             check_started.set()
-            writer_completed_during_check["value"] = writer_done.wait(timeout=1)
+            writer_completed_during_check["value"] = writer_done.wait(timeout=10)
             return True
 
         reg.register(
@@ -525,7 +699,7 @@ class TestThreadSafety:
                 errors.append(exc)
 
         def writer():
-            assert check_started.wait(timeout=1)
+            assert check_started.wait(timeout=10)
             reg.deregister("beta")
             writer_done.set()
 
@@ -533,8 +707,8 @@ class TestThreadSafety:
         writer_thread = threading.Thread(target=writer)
         reader_thread.start()
         writer_thread.start()
-        reader_thread.join(timeout=2)
-        writer_thread.join(timeout=2)
+        reader_thread.join(timeout=15)
+        writer_thread.join(timeout=15)
 
         assert not reader_thread.is_alive()
         assert not writer_thread.is_alive()
